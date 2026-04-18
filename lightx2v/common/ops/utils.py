@@ -50,10 +50,28 @@ def get_source_tensor(source_name, weight_dict, lazy_load, lazy_load_file, use_i
         if Path(lazy_load_file).is_file():
             lazy_load_file_path = lazy_load_file
         else:
-            lazy_load_file_path = os.path.join(
-                lazy_load_file,
-                f"block_{source_name.split('.')[1]}.safetensors",
-            )
+            # Check if we have a safetensors index file
+            index_file = os.path.join(lazy_load_file, "diffusion_pytorch_model.safetensors.index.json")
+            if os.path.exists(index_file):
+                import json
+
+                with open(index_file, "r") as f:
+                    index_data = json.load(f)
+                # Find the file containing the tensor
+                if source_name in index_data["weight_map"]:
+                    lazy_load_file_path = os.path.join(lazy_load_file, index_data["weight_map"][source_name])
+                else:
+                    # Fall back to block file if tensor not found in index
+                    lazy_load_file_path = os.path.join(
+                        lazy_load_file,
+                        f"block_{source_name.split('.')[1]}.safetensors",
+                    )
+            else:
+                # Fall back to block file if no index file
+                lazy_load_file_path = os.path.join(
+                    lazy_load_file,
+                    f"block_{source_name.split('.')[1]}.safetensors",
+                )
         with safe_open(lazy_load_file_path, framework="pt", device="cpu") as lazy_load_file:
             if use_infer_dtype:
                 return lazy_load_file.get_tensor(source_name).to(GET_DTYPE())
@@ -107,6 +125,17 @@ def get_lazy_load_file_path(lazy_load_file, weight_name_for_block=None):
     if Path(lazy_load_file).is_file():
         return lazy_load_file
     else:
+        # Check if we have a safetensors index file
+        index_file = os.path.join(lazy_load_file, "diffusion_pytorch_model.safetensors.index.json")
+        if os.path.exists(index_file):
+            import json
+
+            with open(index_file, "r") as f:
+                index_data = json.load(f)
+            # Find the file containing the tensor
+            if weight_name_for_block in index_data["weight_map"]:
+                return os.path.join(lazy_load_file, index_data["weight_map"][weight_name_for_block])
+        # Fall back to block file if no index file or tensor not found
         return os.path.join(
             lazy_load_file,
             f"block_{weight_name_for_block.split('.')[1]}.safetensors",

@@ -4,17 +4,21 @@
     "text_len": 512,
     "target_height": 720,
     "target_width": 1280,
-    "self_attn_1_type": "flash_attn3",
-    "cross_attn_1_type": "flash_attn3",
-    "cross_attn_2_type": "flash_attn3",
+    "self_attn_1_type": "flash_attn2",
+    "cross_attn_1_type": "flash_attn2",
+    "cross_attn_2_type": "flash_attn2",
     "sample_guide_scale": [
-        3.5,
-        3.5
+        5,
+        5
     ],
-    "sample_shift": 5.0,
+    "sample_shift": 3.0,
     "enable_cfg": false,
-    "cpu_offload": false,
-    "offload_granularity": "model",
+    "cpu_offload": true,
+    "offload_granularity": "phase",
     "boundary": 0.900,
-    "use_image_encoder": false
+    "use_image_encoder": false,
+    "lazy_load": true,
+    "offload_ratio": 1.0,
+    "num_disk_workers": 2,
+    "offload_to_disk": true
 }

@@ -45,7 +45,22 @@ class DefaultTensor:
             if Path(self.lazy_load_file).is_file():
                 lazy_load_file_path = self.lazy_load_file
             else:
-                lazy_load_file_path = os.path.join(self.lazy_load_file, f"block_{self.tensor_name.split('.')[1]}.safetensors")
+                # Check if we have a safetensors index file
+                index_file = os.path.join(self.lazy_load_file, "diffusion_pytorch_model.safetensors.index.json")
+                if os.path.exists(index_file):
+                    import json
+
+                    with open(index_file, "r") as f:
+                        index_data = json.load(f)
+                    # Find the file containing the tensor
+                    if self.tensor_name in index_data["weight_map"]:
+                        lazy_load_file_path = os.path.join(self.lazy_load_file, index_data["weight_map"][self.tensor_name])
+                    else:
+                        # Fall back to block file if tensor not found in index
+                        lazy_load_file_path = os.path.join(self.lazy_load_file, f"block_{self.tensor_name.split('.')[1]}.safetensors")
+                else:
+                    # Fall back to block file if no index file
+                    lazy_load_file_path = os.path.join(self.lazy_load_file, f"block_{self.tensor_name.split('.')[1]}.safetensors")
             with safe_open(lazy_load_file_path, framework="pt", device="cpu") as lazy_load_file:
                 tensor = lazy_load_file.get_tensor(self.tensor_name)
                 if use_infer_dtype:
@@ -103,7 +118,22 @@ class DefaultTensor:
         if Path(self.lazy_load_file).is_file():
             lazy_load_file_path = self.lazy_load_file
         else:
-            lazy_load_file_path = os.path.join(self.lazy_load_file, f"block_{block_index}.safetensors")
+            # Check if we have a safetensors index file
+            index_file = os.path.join(self.lazy_load_file, "diffusion_pytorch_model.safetensors.index.json")
+            if os.path.exists(index_file):
+                import json
+
+                with open(index_file, "r") as f:
+                    index_data = json.load(f)
+                # Find the file containing the tensor
+                if self.tensor_name in index_data["weight_map"]:
+                    lazy_load_file_path = os.path.join(self.lazy_load_file, index_data["weight_map"][self.tensor_name])
+                else:
+                    # Fall back to block file if tensor not found in index
+                    lazy_load_file_path = os.path.join(self.lazy_load_file, f"block_{block_index}.safetensors")
+            else:
+                # Fall back to block file if no index file
+                lazy_load_file_path = os.path.join(self.lazy_load_file, f"block_{block_index}.safetensors")
         with safe_open(lazy_load_file_path, framework="pt", device="cpu") as lazy_load_file:
             tensor = lazy_load_file.get_tensor(self.tensor_name).to(self.infer_dtype)
             self.pin_tensor = self.pin_tensor.copy_(tensor)

@@ -1,16 +1,17 @@
 {
-    "infer_steps": 40,
+    "infer_steps": 1,
     "target_video_length": 81,
-    "target_height": 480,
-    "target_width": 832,
-    "self_attn_1_type": "sage_attn2",
-    "cross_attn_1_type": "sage_attn2",
-    "cross_attn_2_type": "sage_attn2",
+    "target_height": 720,
+    "target_width": 1280,
+    "self_attn_1_type": "flash_attn2",
+    "cross_attn_1_type": "flash_attn2",
+    "cross_attn_2_type": "flash_attn2",
     "sample_guide_scale": 5,
-    "sample_shift": 5,
+    "sample_shift": 3,
     "enable_cfg": true,
-    "cpu_offload": false,
-    "dit_quantized_ckpt": "/path/to/int8/model",
+    "cpu_offload": true,
+    "offload_granularity": "block",
     "dit_quantized": true,
-    "dit_quant_scheme": "int8-vllm"
+    "dit_quant_scheme": "nvfp4",
+    "dit_quantized_ckpt": "/root/autodl-tmp/LightX2V/models/Wan2.1-I2V-14B-720P-NVFP4/wan2.1_i2v_720p_nvfp4_complete.safetensors"
 }

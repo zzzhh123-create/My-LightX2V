@@ -1,32 +1,41 @@
-*.pth
-*.pt
-*.onnx
-*.pk
-*.model
-*.zip
-*.tar
+# 模型文件（上传到 Hugging Face）
+models/
+
+# Python 缓存
+__pycache__/
 *.pyc
-*.log
-*.o
+*.pyo
+*.pyd
+
+# Jupyter notebook 检查点
+.ipynb_checkpoints/
+*.ipynb
+
+# 编译构建文件
+lightx2v_kernel/build/
 *.so
+*.o
 *.a
-*.exe
-*.out
-.idea
-**.DS_Store**
-**/__pycache__/**
-**.swp
-.vscode/
-.env
-.log
-*.pid
-*.ipynb*
-*.mp4
-build/
-dist/
-.cache/
-server_cache/
-app/.gradio/
-*.pkl
-save_results/*
+
+# Python 打包文件
 *.egg-info/
+*.egg
+
+# 安装包
+*.whl
+
+# 日志和临时文件
+*.log
+wget-log
+*.json
+step1_trace_*.json
+
+# 结果文件
+save_results/
+
+# 校准文件
+calib.pt
+
+# 其他临时文件
+full_debug.log
+constraints.txt

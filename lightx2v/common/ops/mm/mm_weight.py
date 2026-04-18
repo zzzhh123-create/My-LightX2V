@@ -170,9 +170,10 @@ class MMWeightTemplate(metaclass=ABCMeta):
             return self.bias + self.bias_diff
 
     def apply_lora(self, input_tensor):
-        h = torch.mm(input_tensor, self.lora_down.t())
-        out = torch.mm(h, self.lora_up.t())
-        return self.lora_strength * self.lora_scale * out
+        dtype = input_tensor.dtype
+        h = torch.mm(input_tensor, self.lora_down.t().to(dtype))
+        out = torch.mm(h, self.lora_up.t().to(dtype))
+        return self.lora_strength * self.lora_scale.to(dtype) * out
 
     def set_config(self, config={}):
         self.config = config
@@ -294,11 +295,11 @@ class MMWeight(MMWeightTemplate):
             self.pin_weight = pin_tensors.get("weight")
             self.pin_bias = pin_tensors.get("bias")
         elif self.create_cuda_buffer:
-            result = create_cuda_buffers(self.base_attrs, weight_dict, self.lazy_load, self.lazy_load_file)
+            result = create_cuda_buffers(self.base_attrs, weight_dict, self.lazy_load, self.lazy_load_file, use_infer_dtype=True)
             self.weight_cuda_buffer = result.get("weight")
             self.bias_cuda_buffer = result.get("bias")
         elif self.create_cpu_buffer:
-            result = create_cpu_buffers(self.base_attrs, self.lazy_load_file)
+            result = create_cpu_buffers(self.base_attrs, self.lazy_load_file, use_infer_dtype=True)
             self.pin_weight = result.get("weight")
             self.pin_bias = result.get("bias")
             self.weight = None
@@ -310,14 +311,19 @@ class MMWeight(MMWeightTemplate):
         device = input_tensor.device
         output_tensor = torch.empty(shape, dtype=dtype, device=device, requires_grad=False)
 
+        weight = self._get_actual_weight().to(dtype)
+        bias = self._get_actual_bias()
+        if bias is not None:
+            bias = bias.to(dtype)
+
         if not self.has_lora_branch:
-            if hasattr(self, "bias") and self.bias is not None:
-                return torch.addmm(self._get_actual_bias(), input_tensor, self._get_actual_weight(), out=output_tensor)
-            return torch.mm(input_tensor, self._get_actual_weight(), out=output_tensor)
+            if bias is not None:
+                return torch.addmm(bias, input_tensor, weight, out=output_tensor)
+            return torch.mm(input_tensor, weight, out=output_tensor)
         else:
-            if hasattr(self, "bias") and self.bias is not None:
-                return torch.addmm(self._get_actual_bias(), input_tensor, self._get_actual_weight(), out=output_tensor) + self.apply_lora(input_tensor)
-            return torch.mm(input_tensor, self._get_actual_weight(), out=output_tensor) + self.apply_lora(input_tensor)
+            if bias is not None:
+                return torch.addmm(bias, input_tensor, weight, out=output_tensor) + self.apply_lora(input_tensor)
+            return torch.mm(input_tensor, weight, out=output_tensor) + self.apply_lora(input_tensor)
 
     def load_state_dict_from_disk(self, block_index, adapter_block_index=None):
         if self.has_lora_branch or self.has_diff:

@@ -321,7 +321,11 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
                 if os.path.exists(non_block_file):
                     safetensors_files = [non_block_file]
                 else:
-                    raise ValueError(f"Non-block file not found in {safetensors_path}. Please check the model path.")
+                    # If non_block.safetensors not found, use all safetensors files
+                    # This handles models split into multiple files without non_block.safetensors
+                    safetensors_files = glob.glob(os.path.join(safetensors_path, "*.safetensors"))
+                    if not safetensors_files:
+                        raise ValueError(f"No safetensors files found in {safetensors_path}. Please check the model path.")
             else:
                 safetensors_files = glob.glob(os.path.join(safetensors_path, "*.safetensors"))
         else:
@@ -376,7 +380,11 @@ class BaseTransformerModel(CompiledMethodsMixin, ABC):
                 if os.path.exists(non_block_file):
                     safetensors_files = [non_block_file]
                 else:
-                    raise ValueError(f"Non-block file not found in {safetensors_path}. Please check the model path.")
+                    # If non_block.safetensors not found, use all safetensors files
+                    # This handles models split into multiple files without non_block.safetensors
+                    safetensors_files = glob.glob(os.path.join(safetensors_path, "*.safetensors"))
+                    if not safetensors_files:
+                        raise ValueError(f"No safetensors files found in {safetensors_path}. Please check the model path.")
             else:
                 safetensors_files = glob.glob(os.path.join(safetensors_path, "*.safetensors"))
         else:
