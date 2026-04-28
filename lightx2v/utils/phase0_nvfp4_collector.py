@@ -7,10 +7,10 @@ import torch
 
 class Phase0NVFP4Collector:
     def __init__(self):
-        self.reset()  #清空所有数据，开始新的记录
+        self.reset()  # 清空所有数据，开始新的记录
 
     def reset(self):
-        self.shape_rows = defaultdict(int)  #记录形状出现的次数
+        self.shape_rows = defaultdict(int)  # 记录形状出现的次数
         self.timing_rows = defaultdict(
             lambda: {
                 "count": 0,
@@ -18,12 +18,12 @@ class Phase0NVFP4Collector:
                 "gemm_ms_sum": 0.0,
                 "total_ms_sum": 0.0,
             }
-        )   #记录时间数据
-        self.act_rows = []   #记录激活值统计数据
-        self.seen_activation = set()  #记录已经统计过激活值的权重，避免重复统计
+        )  # 记录时间数据
+        self.act_rows = []  # 记录激活值统计数据
+        self.seen_activation = set()  # 记录已经统计过激活值的权重，避免重复统计
 
     def enabled(self):
-        return os.getenv("LIGHTX2V_PHASE0_NVFP4", "0") == "1"  #通过环境变量控制是否启用收集器
+        return os.getenv("LIGHTX2V_PHASE0_NVFP4", "0") == "1"  # 通过环境变量控制是否启用收集器
 
     def record_shape(self, weight_name, bias_name, input_shape, packed_weight_shape):
         # 将输入的形状和权重形状转换为元组，以便作为字典的键使用
@@ -32,7 +32,7 @@ class Phase0NVFP4Collector:
 
         # 提取维度消息
         input_hidden_dim = input_shape[-1]  # 输入的最后一位是隐藏维度
-        output_dim = packed_weight_shape[0] # 输出的维度
+        output_dim = packed_weight_shape[0]  # 输出的维度
 
         key = (
             weight_name,
@@ -105,7 +105,7 @@ class Phase0NVFP4Collector:
         }
 
         for prefix, q in percentile_map.items():
-            #找出超过阈值的异常点
+            # 找出超过阈值的异常点
             threshold = float(torch.quantile(flat_cpu, q))
 
             mask = row_sample > threshold
@@ -145,8 +145,6 @@ class Phase0NVFP4Collector:
             row[f"{prefix}_max_over_threshold"] = max_over_threshold
 
         self.act_rows.append(row)
-
-
 
     def record_timing(self, weight_name, input_shape, quant_ms, gemm_ms, total_ms):
         key = (
@@ -195,7 +193,6 @@ class Phase0NVFP4Collector:
                     "sample_row_max_mean",
                     "sample_row_max_max",
                     "sample_row_p99_mean",
-
                     "p95_outlier_ratio",
                     "p95_token_ratio_mean",
                     "p95_token_ratio_std",
@@ -203,7 +200,6 @@ class Phase0NVFP4Collector:
                     "p95_channel_ratio_max",
                     "p95_channel_ratio_std",
                     "p95_max_over_threshold",
-
                     "p98_outlier_ratio",
                     "p98_token_ratio_mean",
                     "p98_token_ratio_std",
@@ -211,7 +207,6 @@ class Phase0NVFP4Collector:
                     "p98_channel_ratio_max",
                     "p98_channel_ratio_std",
                     "p98_max_over_threshold",
-
                     "p99_outlier_ratio",
                     "p99_token_ratio_mean",
                     "p99_token_ratio_std",
@@ -219,7 +214,6 @@ class Phase0NVFP4Collector:
                     "p99_channel_ratio_max",
                     "p99_channel_ratio_std",
                     "p99_max_over_threshold",
-
                     "p99_5_outlier_ratio",
                     "p99_5_token_ratio_mean",
                     "p99_5_token_ratio_std",
