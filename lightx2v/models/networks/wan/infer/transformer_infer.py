@@ -8,6 +8,7 @@ from lightx2v.utils.registry_factory import *
 
 from .triton_ops import fuse_scale_shift_kernel
 from .utils import apply_wan_rope_with_chunk, apply_wan_rope_with_flashinfer, apply_wan_rope_with_torch, apply_wan_rope_with_torch_naive
+from .ffn_outlier_refine import FFNOutlierRefiner
 
 
 def modulate(x, scale, shift):
@@ -75,6 +76,16 @@ class WanTransformerInfer(BaseTransformerInfer):
         self.infer_func = self.infer_without_offload
 
         self.cos_sin = None
+
+        # Initialize FFN outlier refinement if enabled
+        self.ffn_outlier_refiner = None
+        if config.get("ffn_outlier_refinement", {}).get("enable", False):
+            self.ffn_outlier_refiner = FFNOutlierRefiner(
+                group_size=config["ffn_outlier_refinement"].get("group_size", 64),
+                outlier_percentile=config["ffn_outlier_refinement"].get("outlier_percentile", 0.95),
+                bf16_weight_path=config["ffn_outlier_refinement"].get("bf16_weight_path"),
+                enable_refinement=True,
+            )
 
     @torch.no_grad()
     def reset_post_adapter_states(self):
@@ -341,14 +352,26 @@ class WanTransformerInfer(BaseTransformerInfer):
         if self.sensitive_layer_dtype != self.infer_dtype:
             norm2_out = norm2_out.to(self.infer_dtype)
 
-        y = phase.ffn_0.apply(norm2_out)
+        # FFN layer 0 with optional outlier refinement
+        if self.ffn_outlier_refiner is not None:
+            ffn_0_layer_name = f"blocks.{self.block_idx}.ffn.0.weight"
+            y = self.ffn_outlier_refiner.apply_with_refinement(norm2_out, phase.ffn_0, ffn_0_layer_name)
+        else:
+            y = phase.ffn_0.apply(norm2_out)
+
         if self.clean_cuda_cache:
             del norm2_out, x
             torch.cuda.empty_cache()
         y = torch.nn.functional.gelu(y, approximate="tanh")
         if self.clean_cuda_cache:
             torch.cuda.empty_cache()
-        y = phase.ffn_2.apply(y)
+
+        # FFN layer 2 with optional outlier refinement
+        if self.ffn_outlier_refiner is not None:
+            ffn_2_layer_name = f"blocks.{self.block_idx}.ffn.2.weight"
+            y = self.ffn_outlier_refiner.apply_with_refinement(y, phase.ffn_2, ffn_2_layer_name)
+        else:
+            y = phase.ffn_2.apply(y)
 
         return y
 
