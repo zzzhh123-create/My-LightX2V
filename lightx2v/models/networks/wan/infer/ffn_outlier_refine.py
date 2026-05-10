@@ -203,12 +203,14 @@ class FFNOutlierRefiner:
         y_main = nvfp4_layer.apply(x_main)
 
         # Step 4: Outlier path - BF16 (high precision recovery)
+        # IMPORTANT: Do NOT add bias here - it's already included in y_main
+        # Mathematical correctness: y = (W@x_main + b) + (W@x_outlier) = W@x + b
         if outlier_mask.any():
             weight_bf16, bias_bf16 = self._load_bf16_weight(layer_name)
 
-            # BF16 matmul: x_outlier @ weight_bf16.T
+            # BF16 matmul: x_outlier @ weight_bf16.T (NO BIAS)
             x_outlier_bf16 = x_outlier.to(torch.bfloat16)
-            y_outlier = F.linear(x_outlier_bf16, weight_bf16, bias_bf16)
+            y_outlier = F.linear(x_outlier_bf16, weight_bf16, bias=None)
             y_outlier = y_outlier.to(y_main.dtype)
         else:
             y_outlier = torch.zeros_like(y_main)
