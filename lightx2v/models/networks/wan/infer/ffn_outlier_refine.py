@@ -68,8 +68,9 @@ class FFNOutlierRefiner:
         if self.bf16_weight_path is None:
             raise ValueError("bf16_weight_path must be set to load BF16 weights")
 
-        from safetensors import safe_open
         import os
+
+        from safetensors import safe_open
 
         # Load from safetensors
         if os.path.isdir(self.bf16_weight_path):

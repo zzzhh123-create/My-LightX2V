@@ -6,9 +6,9 @@ from lightx2v.common.transformer_infer.transformer_infer import BaseTransformerI
 from lightx2v.utils.envs import *
 from lightx2v.utils.registry_factory import *
 
+from .ffn_outlier_refine import FFNOutlierRefiner
 from .triton_ops import fuse_scale_shift_kernel
 from .utils import apply_wan_rope_with_chunk, apply_wan_rope_with_flashinfer, apply_wan_rope_with_torch, apply_wan_rope_with_torch_naive
-from .ffn_outlier_refine import FFNOutlierRefiner
 
 
 def modulate(x, scale, shift):
