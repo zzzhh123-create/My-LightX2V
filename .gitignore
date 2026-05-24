@@ -1,41 +1,41 @@
 # 模型文件（上传到 Hugging Face）
-models/
-
 # Python 缓存
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-
 # Jupyter notebook 检查点
 .ipynb_checkpoints/
 *.ipynb
-
 # 编译构建文件
 lightx2v_kernel/build/
 *.so
 *.o
 *.a
-
 # Python 打包文件
 *.egg-info/
 *.egg
-
 # 安装包
 *.whl
-
 # 日志和临时文件
 *.log
 wget-log
-*.json
 step1_trace_*.json
-
 # 结果文件
 save_results/
-
 # 校准文件
 calib.pt
-
 # 其他临时文件
 full_debug.log
 constraints.txt
+profile_result/
+*.bak
+*.profiler
+/models/
+profile_result_v3/
+lightx2v/models/runners/default_runner_bak
+profile_result_v5/
+outputs/
+
+# Third-party: SpInfer (managed as separate git repo)
+third_party/SpInfer/
