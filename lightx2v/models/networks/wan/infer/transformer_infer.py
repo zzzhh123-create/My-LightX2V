@@ -81,11 +81,14 @@ class WanTransformerInfer(BaseTransformerInfer):
         self.ffn_outlier_refiner = None
         if config.get("ffn_outlier_refinement", {}).get("enable", False):
             self.ffn_outlier_refiner = FFNOutlierRefiner(
-                group_size=config["ffn_outlier_refinement"].get("group_size", 64),
                 outlier_percentile=config["ffn_outlier_refinement"].get("outlier_percentile", 0.95),
                 bf16_weight_path=config["ffn_outlier_refinement"].get("bf16_weight_path"),
                 enable_refinement=True,
+                enable_profiling=config["ffn_outlier_refinement"].get("enable_profiling", False),
             )
+
+        # Track current timestep for profiling
+        self.current_timestep = 0
 
     @torch.no_grad()
     def reset_post_adapter_states(self):
@@ -355,7 +358,9 @@ class WanTransformerInfer(BaseTransformerInfer):
         # FFN layer 0 with optional outlier refinement
         if self.ffn_outlier_refiner is not None:
             ffn_0_layer_name = f"blocks.{self.block_idx}.ffn.0.weight"
-            y = self.ffn_outlier_refiner.apply_with_refinement(norm2_out, phase.ffn_0, ffn_0_layer_name)
+            y = self.ffn_outlier_refiner.apply_with_refinement(
+                norm2_out, phase.ffn_0, ffn_0_layer_name, timestep=self.current_timestep
+            )
         else:
             y = phase.ffn_0.apply(norm2_out)
 
@@ -369,7 +374,9 @@ class WanTransformerInfer(BaseTransformerInfer):
         # FFN layer 2 with optional outlier refinement
         if self.ffn_outlier_refiner is not None:
             ffn_2_layer_name = f"blocks.{self.block_idx}.ffn.2.weight"
-            y = self.ffn_outlier_refiner.apply_with_refinement(y, phase.ffn_2, ffn_2_layer_name)
+            y = self.ffn_outlier_refiner.apply_with_refinement(
+                y, phase.ffn_2, ffn_2_layer_name, timestep=self.current_timestep
+            )
         else:
             y = phase.ffn_2.apply(y)
 

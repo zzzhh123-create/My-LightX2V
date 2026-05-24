@@ -184,6 +184,57 @@ def main():
         update_input_info_from_dict(input_info, data)
         runner.run_pipeline(input_info)
 
+    # Save profiling data if enabled
+    if config.get("ffn_outlier_refinement", {}).get("enable_profiling", False):
+        try:
+            # Try to get profiling data from the model
+            model = runner.model if hasattr(runner, "model") else None
+            if model is not None:
+                # Handle both single model and list of models (for MoE)
+                models = model if isinstance(model, list) else [model]
+
+                for model_instance in models:
+                    if hasattr(model_instance, "transformer_infer") and hasattr(model_instance.transformer_infer, "ffn_outlier_refiner"):
+                        refiner = model_instance.transformer_infer.ffn_outlier_refiner
+                        if refiner is not None and hasattr(refiner, "get_profiling_data"):
+                            profiling_data = refiner.get_profiling_data()
+
+                            if profiling_data:
+                                import os
+                                from datetime import datetime
+
+                                # Create output directory
+                                output_dir = "outputs/sparsity_analysis"
+                                os.makedirs(output_dir, exist_ok=True)
+
+                                # Generate filename
+                                percentile = config["ffn_outlier_refinement"].get("outlier_percentile", 0.95)
+                                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                                filename = f"outlier_sparsity_p{int(percentile*100)}_{timestamp}.json"
+                                output_path = os.path.join(output_dir, filename)
+
+                                # Save data
+                                output_data = {
+                                    "metadata": {
+                                        "timestamp": timestamp,
+                                        "percentile": percentile,
+                                        "group_size": getattr(refiner, "group_size", None),
+                                        "num_samples": len(profiling_data),
+                                    },
+                                    "data": profiling_data,
+                                }
+
+                                import json
+                                with open(output_path, "w") as f:
+                                    json.dump(output_data, f, indent=2)
+
+                                logger.info(f"✓ Profiling data saved to: {output_path}")
+                                logger.info(f"  Collected {len(profiling_data)} samples")
+                                logger.info(f"  Run analysis: python scripts/wan/analyze_outlier_sparsity.py {output_path}")
+                                break
+        except Exception as e:
+            logger.warning(f"Failed to save profiling data: {e}")
+
     # Clean up distributed process group
     if dist.is_initialized():
         dist.destroy_process_group()

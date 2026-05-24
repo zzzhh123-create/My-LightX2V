@@ -7,6 +7,15 @@ from lightx2v.models.schedulers.scheduler import BaseScheduler
 from lightx2v.utils.utils import masks_like
 from lightx2v_platform.base.global_var import AI_DEVICE
 
+# Set preferred linear algebra library to avoid cuSOLVER errors
+try:
+    torch.backends.cuda.preferred_linalg_library("cusolver")
+except Exception:
+    try:
+        torch.backends.cuda.preferred_linalg_library("magma")
+    except Exception:
+        pass  # Use default backend
+
 
 class WanScheduler(BaseScheduler):
     def __init__(self, config):
@@ -313,7 +322,16 @@ class WanScheduler(BaseScheduler):
         if order == 1:
             rhos_c = torch.tensor([0.5], dtype=x.dtype, device=device)
         else:
-            rhos_c = torch.linalg.solve(R, b).to(device).to(x.dtype)
+            try:
+                rhos_c = torch.linalg.solve(R, b).to(device).to(x.dtype)
+            except RuntimeError as e:
+                # Fallback to CPU if cuSOLVER fails
+                if "cusolver" in str(e).lower():
+                    R_cpu = R.cpu()
+                    b_cpu = b.cpu()
+                    rhos_c = torch.linalg.solve(R_cpu, b_cpu).to(device).to(x.dtype)
+                else:
+                    raise
 
         x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0
         if D1s is not None:

@@ -158,6 +158,10 @@ class WanModel(BaseTransformerModel):
 
     @torch.no_grad()
     def infer(self, inputs):
+        # Update timestep for profiling
+        if hasattr(self.transformer_infer, 'current_timestep'):
+            self.transformer_infer.current_timestep = self.scheduler.step_index
+
         if self.cpu_offload:
             if self.offload_granularity == "model" and self.scheduler.step_index == 0 and "wan2.2_moe" not in self.config["model_cls"]:
                 self.to_cuda()
