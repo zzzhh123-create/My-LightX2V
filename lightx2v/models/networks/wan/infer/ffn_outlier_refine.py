@@ -39,11 +39,29 @@ class FFNOutlierRefiner:
         bf16_weight_path: str = None,
         enable_refinement: bool = True,
         enable_profiling: bool = False,
+        enable_channel_profiling: bool = False,
+        infer_steps: int = None,
+        save_full_channel_histogram: bool = True,
     ):
         self.outlier_percentile = outlier_percentile
         self.bf16_weight_path = bf16_weight_path
         self.enable_refinement = enable_refinement
         self.enable_profiling = enable_profiling
+
+        # Channel-distribution profiling (research: are outliers concentrated in
+        # a few fixed hidden channels?). Independent of `enable_profiling`.
+        self.enable_channel_profiling = enable_channel_profiling
+        self.infer_steps = infer_steps
+        self.save_full_channel_histogram = save_full_channel_histogram
+
+        # Per-channel outlier counters accumulated on GPU.
+        # Structure: {layer_name: {"hidden_dim": K,
+        #                          "all"/"early"/"middle"/"late": {
+        #                              "count": int64 tensor [K] on GPU,
+        #                              "total_outliers": int}}}
+        self.channel_stats = {}
+        # Actual scheduler timestep values seen per stage (deduped, ordered).
+        self.stage_timesteps = {"early": [], "middle": [], "late": []}
 
         # Cache for BF16 weights: {layer_name: (weight, bias)}
         self.bf16_weight_cache = {}
@@ -57,7 +75,7 @@ class FFNOutlierRefiner:
         # Profiling data collection
         self.profiling_data = [] if enable_profiling else None
 
-        logger.info(f"[FFN Outlier Refine] Initialized with percentile={outlier_percentile}, bf16_path={bf16_weight_path}, profiling={enable_profiling}")
+        logger.info(f"[FFN Outlier Refine] Initialized with percentile={outlier_percentile}, bf16_path={bf16_weight_path}, profiling={enable_profiling}, channel_profiling={enable_channel_profiling}")
 
     def _load_bf16_weight(self, layer_name: str):
         """
@@ -266,6 +284,7 @@ class FFNOutlierRefiner:
         nvfp4_layer,
         layer_name: str,
         timestep: int = None,
+        actual_timestep: float = None,
     ):
         """
         Apply FFN layer with outlier refinement.
@@ -274,7 +293,8 @@ class FFNOutlierRefiner:
             x: Input activation [B, K]
             nvfp4_layer: NVFP4 quantized layer object with .apply() method
             layer_name: Full layer name for BF16 weight loading
-            timestep: Current timestep (for profiling)
+            timestep: Current step index (0..infer_steps-1, for profiling)
+            actual_timestep: Actual scheduler timestep value (e.g. ~1000..0)
 
         Returns:
             output: Combined output from NVFP4 and BF16 paths
@@ -288,6 +308,11 @@ class FFNOutlierRefiner:
         outlier_mask, threshold = self._detect_outlier_elements(x)
         outlier_ratio = outlier_mask.float().mean().item()
         self.stats["outlier_ratio_sum"] += outlier_ratio
+
+        # Channel-distribution profiling (GPU accumulation, no CPU copy here).
+        # Does NOT touch the outlier mask, split, GEMM, or any inference path.
+        if self.enable_channel_profiling:
+            self._accumulate_channel_stats(outlier_mask, layer_name, timestep, actual_timestep)
 
         # Step 2: Split activations
         x_main, x_outlier = self._split_activations(x, outlier_mask)
@@ -334,6 +359,197 @@ class FFNOutlierRefiner:
             "total_calls": 0,
             "outlier_ratio_sum": 0.0,
         }
+
+    # ------------------------------------------------------------------
+    # Channel-distribution profiling
+    # ------------------------------------------------------------------
+    def _stage_of(self, timestep: int) -> str:
+        """Map a step index (0..infer_steps-1) to early/middle/late thirds.
+
+        Earlier step_index == earlier in the diffusion trajectory (high noise).
+        """
+        if self.infer_steps is None or timestep is None:
+            # Fallback: cannot determine stage, treat everything as a single stage.
+            return "early"
+        third = max(1, self.infer_steps // 3)
+        if timestep < third:
+            return "early"
+        elif timestep < 2 * third:
+            return "middle"
+        else:
+            return "late"
+
+    def _accumulate_channel_stats(self, outlier_mask, layer_name, timestep=None, actual_timestep=None):
+        """Accumulate per-channel outlier counts on GPU (no CPU copy).
+
+        channel_outlier_count[k] += number of rows where channel k is an outlier.
+
+        Maintains separate counters for the whole run ("all") and for the
+        early/middle/late diffusion stages, so we can later test whether the
+        set of heavy-hitter channels is stable across the trajectory.
+        """
+        # outlier_mask: [B, K] bool. Per-channel counts over the batch dim.
+        per_channel = outlier_mask.sum(dim=0).to(torch.int64)  # [K] on GPU
+        K = per_channel.numel()
+        batch_outliers = int(per_channel.sum().item())
+
+        if layer_name not in self.channel_stats:
+            self.channel_stats[layer_name] = {"hidden_dim": int(K)}
+            for stage in ("all", "early", "middle", "late"):
+                self.channel_stats[layer_name][stage] = {
+                    "count": torch.zeros(K, dtype=torch.int64, device=per_channel.device),
+                    "total_outliers": 0,
+                }
+
+        entry = self.channel_stats[layer_name]
+        stage = self._stage_of(timestep)
+
+        # Always accumulate into "all", plus the current stage bucket.
+        for tgt in ("all", stage):
+            entry[tgt]["count"] += per_channel
+            entry[tgt]["total_outliers"] += batch_outliers
+
+        # Record the actual scheduler timestep value for this stage (deduped).
+        if actual_timestep is not None:
+            ts = float(actual_timestep)
+            if ts not in self.stage_timesteps[stage]:
+                self.stage_timesteps[stage].append(ts)
+
+    @staticmethod
+    def _topk_analysis(count_tensor):
+        """Given a [K] int64 count tensor, compute coverage, top-K ids,
+        normalized entropy, and Gini coefficient.
+
+        Returns a dict ready for JSON serialization (CPU lists / floats).
+        """
+        import math
+
+        K = count_tensor.numel()
+        total = int(count_tensor.sum().item())
+
+        # Sort descending once; reuse for coverage and top-ids.
+        sorted_counts, sorted_idx = torch.sort(count_tensor, descending=True)
+        sorted_counts_f = sorted_counts.to(torch.float64)
+
+        topk_coverage = {}
+        top_channels = {}
+        for pct, key in ((0.01, "1pct"), (0.05, "5pct"), (0.10, "10pct"), (0.20, "20pct")):
+            n = max(1, math.ceil(K * pct))
+            if total > 0:
+                cov = float(sorted_counts_f[:n].sum().item()) / total
+            else:
+                cov = 0.0
+            topk_coverage[f"top_{key}"] = cov
+            top_channels[f"top_{key}_ids"] = sorted_idx[:n].cpu().tolist()
+
+        # Normalized entropy: H / log(K), in [0, 1]. 0 => concentrated, 1 => uniform.
+        if total > 0:
+            p = sorted_counts_f / total
+            nz = p[p > 0]
+            H = float(-(nz * torch.log(nz)).sum().item())
+            norm_entropy = H / math.log(K) if K > 1 else 0.0
+        else:
+            norm_entropy = 0.0
+
+        # Gini coefficient over the channel-count distribution.
+        # G = (2*Σ i*x_i) / (n*Σ x_i) - (n+1)/n  with x sorted ascending.
+        if total > 0:
+            asc = torch.flip(sorted_counts_f, dims=[0])  # ascending
+            idx = torch.arange(1, K + 1, device=asc.device, dtype=torch.float64)
+            gini = float((2.0 * (idx * asc).sum().item()) / (K * total) - (K + 1.0) / K)
+        else:
+            gini = 0.0
+
+        return {
+            "total_outliers": total,
+            "topk_coverage": topk_coverage,
+            "top_channels": top_channels,
+            "normalized_entropy": norm_entropy,
+            "gini_coefficient": gini,
+        }
+
+    @staticmethod
+    def _jaccard(a, b):
+        """Jaccard similarity |A∩B| / |A∪B| of two id lists."""
+        sa, sb = set(a), set(b)
+        union = sa | sb
+        if not union:
+            return 0.0
+        return len(sa & sb) / len(union)
+
+    def get_channel_profiling_data(self):
+        """Export accumulated channel statistics as a JSON-serializable dict.
+
+        Computes, per layer and per stage (all/early/middle/late):
+          - channel_outlier_count (optional full histogram)
+          - topk_coverage, top_channels, normalized_entropy, gini_coefficient
+        Plus per-layer channel_stability (Jaccard of stage top-ids).
+        """
+        if not self.channel_stats:
+            return None
+
+        # Stage boundaries description.
+        if self.infer_steps is not None:
+            third = max(1, self.infer_steps // 3)
+            stage_boundaries = {
+                "early": f"[0,{third})",
+                "middle": f"[{third},{2 * third})",
+                "late": f"[{2 * third},{self.infer_steps})",
+            }
+        else:
+            stage_boundaries = None
+
+        layers_out = {}
+        for layer_name, entry in self.channel_stats.items():
+            layer_out = {"hidden_dim": entry["hidden_dim"]}
+            stage_top_ids = {}  # for stability
+
+            for stage in ("all", "early", "middle", "late"):
+                count_tensor = entry[stage]["count"]
+                analysis = self._topk_analysis(count_tensor)
+                stage_dict = {
+                    "total_outliers": analysis["total_outliers"],
+                    "topk_coverage": analysis["topk_coverage"],
+                    "top_channels": analysis["top_channels"],
+                    "normalized_entropy": analysis["normalized_entropy"],
+                    "gini_coefficient": analysis["gini_coefficient"],
+                }
+                if self.save_full_channel_histogram:
+                    stage_dict["channel_outlier_count"] = count_tensor.cpu().tolist()
+                layer_out[stage] = stage_dict
+                stage_top_ids[stage] = analysis["top_channels"]
+
+            # Channel stability: Jaccard of top-id sets across stages.
+            stability = {}
+            for pct_key in ("top_1pct_ids", "top_5pct_ids", "top_10pct_ids"):
+                e = stage_top_ids["early"][pct_key]
+                m = stage_top_ids["middle"][pct_key]
+                l = stage_top_ids["late"][pct_key]
+                stability[pct_key.replace("_ids", "")] = {
+                    "early_middle": self._jaccard(e, m),
+                    "middle_late": self._jaccard(m, l),
+                    "early_late": self._jaccard(e, l),
+                }
+            layer_out["channel_stability"] = stability
+            layers_out[layer_name] = layer_out
+
+        # Order recorded timesteps for readability (high noise -> low noise).
+        actual_timestep_range = {
+            stage: sorted(self.stage_timesteps[stage], reverse=True) for stage in ("early", "middle", "late")
+        }
+
+        return {
+            "metadata": {
+                "infer_steps": self.infer_steps,
+                "percentile": self.outlier_percentile,
+                "num_layers": len(layers_out),
+                "stage_boundaries": stage_boundaries,
+                "actual_timestep_range": actual_timestep_range,
+                "save_full_channel_histogram": self.save_full_channel_histogram,
+            },
+            "layers": layers_out,
+        }
+
 
     def _profile_outlier_sparsity(
         self,

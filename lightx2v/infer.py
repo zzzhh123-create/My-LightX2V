@@ -235,6 +235,23 @@ def main():
         except Exception as e:
             logger.warning(f"Failed to save profiling data: {e}")
 
+    # Save channel-distribution profiling data if enabled (independent switch)
+    if config.get("ffn_outlier_refinement", {}).get("enable_channel_profiling", False):
+        try:
+            from lightx2v.models.networks.wan.infer.channel_profiling_export import save_channel_profiling
+
+            model = runner.model if hasattr(runner, "model") else None
+            if model is not None:
+                models = model if isinstance(model, list) else [model]
+                for model_instance in models:
+                    if hasattr(model_instance, "transformer_infer") and hasattr(model_instance.transformer_infer, "ffn_outlier_refiner"):
+                        refiner = model_instance.transformer_infer.ffn_outlier_refiner
+                        if refiner is not None and getattr(refiner, "enable_channel_profiling", False):
+                            save_channel_profiling(refiner, config)
+                            break
+        except Exception as e:
+            logger.warning(f"Failed to save channel profiling data: {e}")
+
     # Clean up distributed process group
     if dist.is_initialized():
         dist.destroy_process_group()

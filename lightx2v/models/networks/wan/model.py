@@ -161,6 +161,12 @@ class WanModel(BaseTransformerModel):
         # Update timestep for profiling
         if hasattr(self.transformer_infer, 'current_timestep'):
             self.transformer_infer.current_timestep = self.scheduler.step_index
+            # Also record the actual scheduler timestep value (e.g. ~1000..0)
+            # for channel-distribution profiling stage labeling.
+            try:
+                self.transformer_infer.current_actual_timestep = float(self.scheduler.timesteps[self.scheduler.step_index])
+            except Exception:
+                self.transformer_infer.current_actual_timestep = None
 
         if self.cpu_offload:
             if self.offload_granularity == "model" and self.scheduler.step_index == 0 and "wan2.2_moe" not in self.config["model_cls"]:

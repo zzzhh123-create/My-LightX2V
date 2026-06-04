@@ -85,10 +85,15 @@ class WanTransformerInfer(BaseTransformerInfer):
                 bf16_weight_path=config["ffn_outlier_refinement"].get("bf16_weight_path"),
                 enable_refinement=True,
                 enable_profiling=config["ffn_outlier_refinement"].get("enable_profiling", False),
+                enable_channel_profiling=config["ffn_outlier_refinement"].get("enable_channel_profiling", False),
+                infer_steps=config.get("infer_steps"),
+                save_full_channel_histogram=config["ffn_outlier_refinement"].get("save_full_channel_histogram", True),
             )
 
         # Track current timestep for profiling
         self.current_timestep = 0
+        # Actual scheduler timestep value (e.g. ~1000..0) for channel profiling.
+        self.current_actual_timestep = None
 
     @torch.no_grad()
     def reset_post_adapter_states(self):
@@ -359,7 +364,7 @@ class WanTransformerInfer(BaseTransformerInfer):
         if self.ffn_outlier_refiner is not None:
             ffn_0_layer_name = f"blocks.{self.block_idx}.ffn.0.weight"
             y = self.ffn_outlier_refiner.apply_with_refinement(
-                norm2_out, phase.ffn_0, ffn_0_layer_name, timestep=self.current_timestep
+                norm2_out, phase.ffn_0, ffn_0_layer_name, timestep=self.current_timestep, actual_timestep=self.current_actual_timestep
             )
         else:
             y = phase.ffn_0.apply(norm2_out)
@@ -375,7 +380,7 @@ class WanTransformerInfer(BaseTransformerInfer):
         if self.ffn_outlier_refiner is not None:
             ffn_2_layer_name = f"blocks.{self.block_idx}.ffn.2.weight"
             y = self.ffn_outlier_refiner.apply_with_refinement(
-                y, phase.ffn_2, ffn_2_layer_name, timestep=self.current_timestep
+                y, phase.ffn_2, ffn_2_layer_name, timestep=self.current_timestep, actual_timestep=self.current_actual_timestep
             )
         else:
             y = phase.ffn_2.apply(y)
