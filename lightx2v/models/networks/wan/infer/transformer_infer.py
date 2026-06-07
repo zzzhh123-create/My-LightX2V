@@ -86,8 +86,10 @@ class WanTransformerInfer(BaseTransformerInfer):
                 enable_refinement=True,
                 enable_profiling=config["ffn_outlier_refinement"].get("enable_profiling", False),
                 enable_channel_profiling=config["ffn_outlier_refinement"].get("enable_channel_profiling", False),
+                enable_channel_coverage_profiling=config["ffn_outlier_refinement"].get("enable_channel_coverage_profiling", False),
                 infer_steps=config.get("infer_steps"),
                 save_full_channel_histogram=config["ffn_outlier_refinement"].get("save_full_channel_histogram", True),
+                enable_sparse_bf16=config["ffn_outlier_refinement"].get("enable_sparse_bf16", False),
             )
 
         # Track current timestep for profiling

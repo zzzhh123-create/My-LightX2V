@@ -40,19 +40,36 @@ class FFNOutlierRefiner:
         enable_refinement: bool = True,
         enable_profiling: bool = False,
         enable_channel_profiling: bool = False,
+        enable_channel_coverage_profiling: bool = False,
         infer_steps: int = None,
         save_full_channel_histogram: bool = True,
+        enable_sparse_bf16: bool = False,
     ):
         self.outlier_percentile = outlier_percentile
         self.bf16_weight_path = bf16_weight_path
         self.enable_refinement = enable_refinement
         self.enable_profiling = enable_profiling
+        # Use cuSPARSE SpMM for the BF16 outlier path when True.
+        # Falls back to dense F.linear automatically on any failure.
+        self.enable_sparse_bf16 = enable_sparse_bf16
 
         # Channel-distribution profiling (research: are outliers concentrated in
         # a few fixed hidden channels?). Independent of `enable_profiling`.
         self.enable_channel_profiling = enable_channel_profiling
         self.infer_steps = infer_steps
         self.save_full_channel_histogram = save_full_channel_histogram
+
+        # Channel coverage profiling: measures element sparsity AND column coverage
+        # per FFN call, then averages across all calls at the end of inference.
+        # Goal: determine whether outliers spread across nearly all channels
+        # (column-skipping useless) or are concentrated in a small subset.
+        self.enable_channel_coverage_profiling = enable_channel_coverage_profiling
+        # Per-layer accumulator: {layer_name: {"calls": int, "col_cov_sum": float,
+        #   "active_cols_sum": float, "K": int,
+        #   "nnz_sum": float, "mean_sum": float, "std_sum": float,
+        #   "max_sum": float, "min_sum": float,
+        #   "top1_sum": float, "top5_sum": float, "top10_sum": float}}
+        self.channel_coverage_stats = {}
 
         # Per-channel outlier counters accumulated on GPU.
         # Structure: {layer_name: {"hidden_dim": K,
@@ -278,6 +295,28 @@ class FFNOutlierRefiner:
 
         return x_main, x_outlier
 
+    def _sparse_bf16_gemm(self, x_outlier_bf16: torch.Tensor, weight_bf16: torch.Tensor) -> torch.Tensor:
+        """
+        Compute x_outlier_bf16 @ weight_bf16.T using cuSPARSE SpMM (CSR format).
+
+        x_outlier_bf16 is ~95% zeros (only outlier elements are non-zero), so
+        converting to CSR and calling torch.mm(CSR, dense) routes through the
+        cuSPARSE SpMM kernel, skipping zero rows and giving a speedup proportional
+        to the sparsity ratio.
+
+        Args:
+            x_outlier_bf16: [B, K] BF16, ~95% sparse (outlier elements only)
+            weight_bf16:    [N, K] BF16, dense
+
+        Returns:
+            [B, N] BF16 output
+        """
+        # to_sparse_csr() produces a 2D CSR tensor on the same CUDA device.
+        # torch.mm(csr, dense) dispatches to cuSPARSE cusparseSpmm for BF16.
+        x_csr = x_outlier_bf16.to_sparse_csr()
+        # weight_bf16.T is [K, N]; non-contiguous is fine as the dense operand.
+        return torch.mm(x_csr, weight_bf16.T)
+
     def apply_with_refinement(
         self,
         x: torch.Tensor,
@@ -314,6 +353,11 @@ class FFNOutlierRefiner:
         if self.enable_channel_profiling:
             self._accumulate_channel_stats(outlier_mask, layer_name, timestep, actual_timestep)
 
+        # Channel coverage profiling: measures per-call active-column fraction and
+        # concentration metrics; accumulates on CPU for end-of-inference summary.
+        if self.enable_channel_coverage_profiling:
+            self._profile_channel_coverage(outlier_mask, layer_name)
+
         # Step 2: Split activations
         x_main, x_outlier = self._split_activations(x, outlier_mask)
 
@@ -332,7 +376,15 @@ class FFNOutlierRefiner:
 
             # BF16 matmul: x_outlier @ weight_bf16.T (NO BIAS)
             x_outlier_bf16 = x_outlier.to(torch.bfloat16)
-            y_outlier = F.linear(x_outlier_bf16, weight_bf16, bias=None)
+            if self.enable_sparse_bf16:
+                try:
+                    y_outlier = self._sparse_bf16_gemm(x_outlier_bf16, weight_bf16)
+                except Exception as e:
+                    logger.warning(f"[FFN Outlier Refine] SparseBF16GEMM failed ({e}), falling back to dense")
+                    self.enable_sparse_bf16 = False  # disable for subsequent calls
+                    y_outlier = F.linear(x_outlier_bf16, weight_bf16, bias=None)
+            else:
+                y_outlier = F.linear(x_outlier_bf16, weight_bf16, bias=None)
             y_outlier = y_outlier.to(y_main.dtype)
         else:
             y_outlier = torch.zeros_like(y_main)
@@ -378,6 +430,166 @@ class FFNOutlierRefiner:
             return "middle"
         else:
             return "late"
+
+    # ------------------------------------------------------------------
+    # Channel coverage profiling (active-column / concentration analysis)
+    # ------------------------------------------------------------------
+
+    def _profile_channel_coverage(self, outlier_mask: torch.Tensor, layer_name: str):
+        """Measure per-call column coverage and concentration; accumulate on CPU.
+
+        All heavy GPU work (sum, sort, topk) stays on GPU; only scalars are
+        transferred to CPU so this adds < 1 % overhead per FFN call.
+
+        Args:
+            outlier_mask: bool [B, K] on GPU – True where element is an outlier.
+            layer_name:   e.g. "blocks.0.ffn.0.weight"
+        """
+        import math
+
+        with torch.no_grad():
+            B, K = outlier_mask.shape
+            total_nnz_elem = int(outlier_mask.sum().item())
+
+            # Per-channel (column) non-zero counts: [K] int64 on GPU.
+            per_channel_nnz = outlier_mask.sum(dim=0).to(torch.int64)  # [K]
+
+            # Active columns: channels that have at least one outlier row.
+            active_cols = int((per_channel_nnz > 0).sum().item())
+            col_coverage = active_cols / K
+
+            # Per-channel NNZ descriptive stats (GPU → scalar).
+            pc_float = per_channel_nnz.float()
+            nnz_mean = float(pc_float.mean().item())
+            nnz_std  = float(pc_float.std().item())
+            nnz_max  = int(per_channel_nnz.max().item())
+            nnz_min  = int(per_channel_nnz.min().item())
+
+            # Top-N% channel concentration (all on GPU, only fractions to CPU).
+            total_nnz_col = int(per_channel_nnz.sum().item())  # == total_nnz_elem
+            sorted_nnz = torch.sort(per_channel_nnz, descending=True).values
+
+            def _top_frac(pct):
+                n = max(1, math.ceil(K * pct))
+                if total_nnz_col == 0:
+                    return 0.0
+                return float(sorted_nnz[:n].sum().item()) / total_nnz_col
+
+            top1  = _top_frac(0.01)
+            top5  = _top_frac(0.05)
+            top10 = _top_frac(0.10)
+
+            # Element sparsity of the outlier mask itself.
+            elem_sparsity = 1.0 - (total_nnz_elem / (B * K))
+
+            # --- Accumulate into per-layer running sums ---
+            if layer_name not in self.channel_coverage_stats:
+                self.channel_coverage_stats[layer_name] = {
+                    "calls": 0,
+                    "K": K,
+                    "col_cov_sum": 0.0,
+                    "active_cols_sum": 0.0,
+                    "nnz_sum": 0,
+                    "nnz_mean_sum": 0.0,
+                    "nnz_std_sum": 0.0,
+                    "nnz_max_sum": 0,
+                    "nnz_min_sum": 0,
+                    "elem_sparsity_sum": 0.0,
+                    "top1_sum": 0.0,
+                    "top5_sum": 0.0,
+                    "top10_sum": 0.0,
+                    # For per-call logging: store (B, K, shape_str) once
+                    "shape_example": f"({B}, {K})",
+                }
+
+            acc = self.channel_coverage_stats[layer_name]
+            acc["calls"]            += 1
+            acc["col_cov_sum"]      += col_coverage
+            acc["active_cols_sum"]  += active_cols
+            acc["nnz_sum"]          += total_nnz_elem
+            acc["nnz_mean_sum"]     += nnz_mean
+            acc["nnz_std_sum"]      += nnz_std
+            acc["nnz_max_sum"]      += nnz_max
+            acc["nnz_min_sum"]      += nnz_min
+            acc["elem_sparsity_sum"]+= elem_sparsity
+            acc["top1_sum"]         += top1
+            acc["top5_sum"]         += top5
+            acc["top10_sum"]        += top10
+
+            # Per-call log (verbose, one line per FFN call).
+            logger.debug(
+                f"[CovProfile] {layer_name} | shape={B}×{K} "
+                f"NNZ={total_nnz_elem} sparsity={elem_sparsity:.2%} "
+                f"active_cols={active_cols}/{K} ({col_coverage:.2%}) "
+                f"top1%={top1:.2%} top5%={top5:.2%} top10%={top10:.2%}"
+            )
+
+    def print_channel_coverage_summary(self):
+        """Print a human-readable summary of accumulated channel coverage stats.
+
+        Call this once after inference completes.  Reports average column
+        coverage, NNZ statistics, and concentration metrics per layer, then
+        prints a grand average across all layers.
+        """
+        if not self.channel_coverage_stats:
+            logger.info("[Outlier Channel Coverage] No data collected (enable_channel_coverage_profiling=False or no calls).")
+            return
+
+        sep = "=" * 70
+        logger.info(sep)
+        logger.info("[Outlier Channel Coverage Summary]")
+        logger.info(sep)
+
+        global_col_cov   = []
+        global_sparsity  = []
+        global_top1      = []
+        global_top5      = []
+        global_top10     = []
+
+        for layer_name, acc in sorted(self.channel_coverage_stats.items()):
+            n     = acc["calls"]
+            K     = acc["K"]
+            shape = acc["shape_example"]
+
+            avg_col_cov    = acc["col_cov_sum"]      / n
+            avg_active     = acc["active_cols_sum"]  / n
+            avg_sparsity   = acc["elem_sparsity_sum"]/ n
+            avg_nnz        = acc["nnz_sum"]          / n
+            avg_mean       = acc["nnz_mean_sum"]     / n
+            avg_std        = acc["nnz_std_sum"]      / n
+            avg_max        = acc["nnz_max_sum"]      / n
+            avg_min        = acc["nnz_min_sum"]      / n
+            avg_top1       = acc["top1_sum"]         / n
+            avg_top5       = acc["top5_sum"]         / n
+            avg_top10      = acc["top10_sum"]        / n
+
+            global_col_cov.append(avg_col_cov)
+            global_sparsity.append(avg_sparsity)
+            global_top1.append(avg_top1)
+            global_top5.append(avg_top5)
+            global_top10.append(avg_top10)
+
+            logger.info(f"\n  Layer: {layer_name}")
+            logger.info(f"  Shape (example): {shape}  |  Calls: {n}")
+            logger.info(f"  Total NNZ (avg per call): {avg_nnz:.0f}")
+            logger.info(f"  Element Sparsity (avg):   {avg_sparsity:.2%}")
+            logger.info(f"  Active Columns (avg):     {avg_active:.1f} / {K}  ({avg_col_cov:.2%})")
+            logger.info(f"  NNZ per Channel — mean: {avg_mean:.2f}  std: {avg_std:.2f}  "
+                        f"min: {avg_min:.1f}  max: {avg_max:.1f}")
+            logger.info(f"  Channel Concentration:")
+            logger.info(f"    Top  1% channels cover: {avg_top1:.2%}")
+            logger.info(f"    Top  5% channels cover: {avg_top5:.2%}")
+            logger.info(f"    Top 10% channels cover: {avg_top10:.2%}")
+
+        logger.info(sep)
+        logger.info("[Grand Average Across All Layers]")
+        import statistics
+        logger.info(f"  Avg Column Coverage:  {statistics.mean(global_col_cov):.2%}")
+        logger.info(f"  Avg Element Sparsity: {statistics.mean(global_sparsity):.2%}")
+        logger.info(f"  Avg Top-1%  Coverage: {statistics.mean(global_top1):.2%}")
+        logger.info(f"  Avg Top-5%  Coverage: {statistics.mean(global_top5):.2%}")
+        logger.info(f"  Avg Top-10% Coverage: {statistics.mean(global_top10):.2%}")
+        logger.info(sep)
 
     def _accumulate_channel_stats(self, outlier_mask, layer_name, timestep=None, actual_timestep=None):
         """Accumulate per-channel outlier counts on GPU (no CPU copy).

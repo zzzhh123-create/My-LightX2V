@@ -252,6 +252,21 @@ def main():
         except Exception as e:
             logger.warning(f"Failed to save channel profiling data: {e}")
 
+    # Print channel coverage summary if enabled
+    if config.get("ffn_outlier_refinement", {}).get("enable_channel_coverage_profiling", False):
+        try:
+            model = runner.model if hasattr(runner, "model") else None
+            if model is not None:
+                models = model if isinstance(model, list) else [model]
+                for model_instance in models:
+                    if hasattr(model_instance, "transformer_infer") and hasattr(model_instance.transformer_infer, "ffn_outlier_refiner"):
+                        refiner = model_instance.transformer_infer.ffn_outlier_refiner
+                        if refiner is not None and getattr(refiner, "enable_channel_coverage_profiling", False):
+                            refiner.print_channel_coverage_summary()
+                            break
+        except Exception as e:
+            logger.warning(f"Failed to print channel coverage summary: {e}")
+
     # Clean up distributed process group
     if dist.is_initialized():
         dist.destroy_process_group()
