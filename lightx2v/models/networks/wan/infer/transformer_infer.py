@@ -90,12 +90,37 @@ class WanTransformerInfer(BaseTransformerInfer):
                 infer_steps=config.get("infer_steps"),
                 save_full_channel_histogram=config["ffn_outlier_refinement"].get("save_full_channel_histogram", True),
                 enable_sparse_bf16=config["ffn_outlier_refinement"].get("enable_sparse_bf16", False),
+                channel_selection=config["ffn_outlier_refinement"].get("channel_selection", None),
+                threshold_mode=config["ffn_outlier_refinement"].get("threshold_mode", "sample"),
+                threshold_sample_size=config["ffn_outlier_refinement"].get("threshold_sample_size", 2_000_000),
+                threshold_seed=config["ffn_outlier_refinement"].get("threshold_seed", 0),
+                dump_activations=config["ffn_outlier_refinement"].get("dump_activations", False),
+                dump_dir=config["ffn_outlier_refinement"].get("dump_dir", "outputs/ffn_act_dump"),
+                dump_layers=config["ffn_outlier_refinement"].get("dump_layers", None),
+                dump_max_steps=config["ffn_outlier_refinement"].get("dump_max_steps", 4),
             )
 
         # Track current timestep for profiling
         self.current_timestep = 0
         # Actual scheduler timestep value (e.g. ~1000..0) for channel profiling.
         self.current_actual_timestep = None
+
+    @torch.no_grad()
+    def preload_ffn_bf16_weights(self):
+        """Eagerly load every FFN BF16 correction weight into the GPU cache.
+
+        Mirrors the NVFP4 weights being resident before inference starts: called
+        once before the first scheduler step so the BF16 outlier/channel path
+        never stalls on a lazy load during step 0. Idempotent — subsequent calls
+        are no-ops because the weights are already cached.
+        """
+        if self.ffn_outlier_refiner is None:
+            return
+        layer_names = []
+        for i in range(self.blocks_num):
+            layer_names.append(f"blocks.{i}.ffn.0.weight")
+            layer_names.append(f"blocks.{i}.ffn.2.weight")
+        self.ffn_outlier_refiner.preload_bf16_weights(layer_names)
 
     @torch.no_grad()
     def reset_post_adapter_states(self):

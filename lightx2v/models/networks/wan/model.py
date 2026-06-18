@@ -168,6 +168,12 @@ class WanModel(BaseTransformerModel):
             except Exception:
                 self.transformer_infer.current_actual_timestep = None
 
+        # Preload all BF16 FFN correction weights before the first step so the
+        # outlier/channel BF16 path is resident up front (like the NVFP4 weights),
+        # instead of paying lazy-load stalls on the first FFN call. Idempotent.
+        if self.scheduler.step_index == 0 and hasattr(self.transformer_infer, "preload_ffn_bf16_weights"):
+            self.transformer_infer.preload_ffn_bf16_weights()
+
         if self.cpu_offload:
             if self.offload_granularity == "model" and self.scheduler.step_index == 0 and "wan2.2_moe" not in self.config["model_cls"]:
                 self.to_cuda()

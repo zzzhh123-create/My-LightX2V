@@ -14,6 +14,8 @@ Method:
 Scope: FFN layers only (ffn.0, ffn.2)
 """
 
+import os
+
 import torch
 import torch.nn.functional as F
 from loguru import logger
@@ -44,6 +46,14 @@ class FFNOutlierRefiner:
         infer_steps: int = None,
         save_full_channel_histogram: bool = True,
         enable_sparse_bf16: bool = False,
+        channel_selection: dict = None,
+        threshold_mode: str = "sample",
+        threshold_sample_size: int = 2_000_000,
+        threshold_seed: int = 0,
+        dump_activations: bool = False,
+        dump_dir: str = "outputs/ffn_act_dump",
+        dump_layers: list = None,
+        dump_max_steps: int = 4,
     ):
         self.outlier_percentile = outlier_percentile
         self.bf16_weight_path = bf16_weight_path
@@ -52,6 +62,107 @@ class FFNOutlierRefiner:
         # Use cuSPARSE SpMM for the BF16 outlier path when True.
         # Falls back to dense F.linear automatically on any failure.
         self.enable_sparse_bf16 = enable_sparse_bf16
+
+        # ------------------------------------------------------------------
+        # Threshold (percentile) computation mode
+        # ------------------------------------------------------------------
+        # The per-call outlier threshold tau is the p-th percentile of |x|.
+        # Two modes, switchable via config (configs/quantization/wan_i2v.json):
+        #
+        #   "exact"  -> _compute_percentile_chunked: multi-pass abs+topk over the
+        #               WHOLE tensor + a torch.sort over tens of millions of merged
+        #               values. ~35 ms (ffn.0, 386M elems) / ~95 ms (ffn.2, 1.04B).
+        #
+        #   "sample" -> _compute_percentile_sampled (DEFAULT): draw a uniform random
+        #               subset of `threshold_sample_size` elements, sort the subset,
+        #               read off the percentile. ~0.33 ms regardless of K.
+        #
+        # Why "sample" is the default and does NOT sacrifice accuracy:
+        #   Benchmarked on real dumped FFN activations (tools/bench_threshold_methods.py
+        #   + bench_threshold_variance.py), the p95 percentile of a B*K~=0.4-1B element
+        #   tensor estimated from a 2M uniform sample has, vs the TRUE full-tensor
+        #   percentile:
+        #     - threshold bias  ~0.05-0.3%   (run-to-run std 0.02-0.04 pp on ratio)
+        #     - realized outlier ratio within +-0.03 pp of 5.00%
+        #     - channel-selection set Jaccard ~0.99 vs the exact-threshold set
+        #   The "exact" chunked method is itself NOT bit-exact w.r.t. the true
+        #   percentile: it carries a 2.3% mean (up to ~10% on the 1B-elem ffn.2)
+        #   threshold bias and yields 5.1-5.7% outliers, because its top-k collection
+        #   ratio + adjusted-percentile remap is an approximation. The 2M sample is
+        #   therefore CLOSER to the true percentile than "exact" while being 100-300x
+        #   faster. Sample variance at n=2M is far below the exact method's own slop.
+        #
+        # A fixed-seed CUDA generator makes the sampling deterministic across runs
+        # (same activations -> same threshold -> reproducible video), so enabling the
+        # fast path does not introduce nondeterminism into generation.
+        self.threshold_mode = threshold_mode
+        self.threshold_sample_size = int(threshold_sample_size)
+        self.threshold_seed = int(threshold_seed)
+        # Lazily created on first use (must live on the activation's CUDA device).
+        self._thr_gen = None
+
+        # ------------------------------------------------------------------
+        # Activation dump hook (offline threshold-method research only)
+        # ------------------------------------------------------------------
+        # When enabled, saves the raw FFN input x (before any masking/splitting)
+        # to .pt files for offline analysis by tools/bench_threshold_methods.py
+        # and tools/analyze_threshold_stability.py. Default OFF and fully guarded:
+        # when disabled it adds nothing to the inference path. Naming convention
+        # matches what the bench scripts expect:
+        #   blocks_{idx}_ffn_{0|2}_weight__step{step}.pt
+        self.dump_activations = bool(dump_activations)
+        self.dump_dir = dump_dir
+        # Default to a small representative set spanning shallow/mid/deep blocks
+        # and both FFN positions if none specified.
+        self.dump_layers = dump_layers if dump_layers else [
+            "blocks.0.ffn.0", "blocks.1.ffn.0", "blocks.20.ffn.0", "blocks.39.ffn.0",
+            "blocks.0.ffn.2", "blocks.20.ffn.2", "blocks.39.ffn.2",
+        ]
+        self.dump_max_steps = int(dump_max_steps)
+        if self.dump_activations:
+            os.makedirs(self.dump_dir, exist_ok=True)
+            logger.info(f"[FFN Outlier Refine] Activation dump ENABLED -> {self.dump_dir} (layers={self.dump_layers}, max_steps={self.dump_max_steps})")
+
+        # ------------------------------------------------------------------
+        # Channel-level refinement (structured column sparsity)
+        # ------------------------------------------------------------------
+        # When enabled, the BF16 correction path operates on a SUBSET of input
+        # channels (columns) instead of per-element. This is the only variant
+        # that actually reduces the BF16 GEMM contraction dimension K -> M and
+        # therefore cuts FLOPs (per-element selection leaves the GEMM dense).
+        #
+        # Decomposition (exact):
+        #   S = active channel set, |S| = M
+        #   y = NVFP4(W) @ x_main + b   +   W[:, S] @ x[:, S]
+        #   where x_main has columns in S zeroed.
+        # Active columns get exact BF16 over their whole column; inactive
+        # columns are fully handled by NVFP4 (per the requirement).
+        #
+        # channel_selection dict keys:
+        #   "enable": bool                      -> turn on channel mode
+        #   "mode": str                         -> selection rule (see below)
+        #   "channel_ratio": float (topm_mass)  -> M = ceil(ratio * K), fixed budget
+        #   "max_channel_ratio": float          -> hard cap on M for all modes
+        #   "count_n": int (count/two_level)    -> min #elements > tau per channel
+        #   "alpha": float (mass/two_level)     -> channel kept if max|x| >= alpha*tau
+        #
+        # modes:
+        #   "topm_mass"       (default) top-M channels by outlier-mass score,
+        #                               score[k] = sum_b |x[b,k]| * 1[|x[b,k]|>tau].
+        #                               Fixed M -> structured sparsity, deterministic FLOPs.
+        #   "count_threshold" channel active if count(|x|>tau) >= count_n.
+        #   "mass_threshold"  channel active if max_b |x[b,k]| >= alpha * tau.
+        #   "two_level"       count >= count_n AND max|x| >= alpha*tau.
+        cs = channel_selection or {}
+        self.channel_mode_enabled = bool(cs.get("enable", False))
+        self.channel_select_mode = cs.get("mode", "topm_mass")
+        self.channel_ratio = float(cs.get("channel_ratio", 0.10))
+        self.channel_max_ratio = float(cs.get("max_channel_ratio", 0.50))
+        self.channel_count_n = int(cs.get("count_n", 8))
+        self.channel_alpha = float(cs.get("alpha", 4.0))
+        # Running stats for the channel path: active-channel ratio per layer.
+        self.channel_active_ratio_sum = 0.0
+        self.channel_calls = 0
 
         # Channel-distribution profiling (research: are outliers concentrated in
         # a few fixed hidden channels?). Independent of `enable_profiling`.
@@ -93,6 +204,13 @@ class FFNOutlierRefiner:
         self.profiling_data = [] if enable_profiling else None
 
         logger.info(f"[FFN Outlier Refine] Initialized with percentile={outlier_percentile}, bf16_path={bf16_weight_path}, profiling={enable_profiling}, channel_profiling={enable_channel_profiling}")
+        logger.info(f"[FFN Outlier Refine] Threshold mode={self.threshold_mode} (sample_size={self.threshold_sample_size}, seed={self.threshold_seed})")
+        if self.channel_mode_enabled:
+            logger.info(
+                f"[FFN Outlier Refine] Channel-level refinement ENABLED | "
+                f"mode={self.channel_select_mode} channel_ratio={self.channel_ratio} "
+                f"max_ratio={self.channel_max_ratio} count_n={self.channel_count_n} alpha={self.channel_alpha}"
+            )
 
     def _load_bf16_weight(self, layer_name: str):
         """
@@ -149,6 +267,120 @@ class FFNOutlierRefiner:
         logger.info(f"[FFN Outlier Refine] Loaded BF16 weight for {layer_name}")
 
         return weight_tensor, bias_tensor
+
+    def preload_bf16_weights(self, layer_names):
+        """Eagerly load all BF16 FFN weights into the GPU cache up front.
+
+        Called once before the first inference step so the BF16 correction path
+        does not pay a load stall on its first FFN call (mirrors how the NVFP4
+        weights are resident before inference begins).
+
+        Unlike repeated `_load_bf16_weight` calls — which reopen every
+        safetensors shard for every layer (O(files × layers)) — this opens each
+        shard exactly once and pulls out every requested tensor it contains
+        (O(files)).
+
+        Args:
+            layer_names: iterable of full weight names, e.g.
+                         ["blocks.0.ffn.0.weight", "blocks.0.ffn.2.weight", ...]
+        """
+        if self.bf16_weight_path is None:
+            raise ValueError("bf16_weight_path must be set to load BF16 weights")
+
+        # Only load layers not already cached (idempotent across steps).
+        pending = [ln for ln in layer_names if ln not in self.bf16_weight_cache]
+        if not pending:
+            return
+
+        import os
+
+        from safetensors import safe_open
+
+        if os.path.isdir(self.bf16_weight_path):
+            import glob
+
+            safetensor_files = sorted(glob.glob(os.path.join(self.bf16_weight_path, "*.safetensors")))
+        else:
+            safetensor_files = [self.bf16_weight_path]
+
+        remaining = set(pending)
+        loaded = 0
+        for file_path in safetensor_files:
+            if not remaining:
+                break
+            with safe_open(file_path, framework="pt", device="cpu") as f:
+                keys = set(f.keys())
+                # Intersect this shard's keys with what we still need.
+                for layer_name in list(remaining):
+                    if layer_name not in keys:
+                        continue
+                    weight_tensor = f.get_tensor(layer_name).to(torch.bfloat16).cuda()
+                    bias_name = layer_name.replace(".weight", ".bias")
+                    bias_tensor = f.get_tensor(bias_name).to(torch.bfloat16).cuda() if bias_name in keys else None
+                    self.bf16_weight_cache[layer_name] = (weight_tensor, bias_tensor)
+                    remaining.discard(layer_name)
+                    loaded += 1
+
+        if remaining:
+            raise ValueError(f"Could not find BF16 weights for {sorted(remaining)} in {self.bf16_weight_path}")
+
+        logger.info(f"[FFN Outlier Refine] Preloaded {loaded} BF16 FFN weights into GPU cache ({len(self.bf16_weight_cache)} total cached)")
+
+    def _compute_threshold(self, x: torch.Tensor, percentile: float):
+        """Dispatch to the configured threshold estimator.
+
+        "sample" (default): fast uniform-sample percentile, ~0.33 ms, accuracy
+                            within the exact method's own slop (see __init__ note).
+        "exact":            the original chunked top-k + sort, ~35-95 ms.
+
+        Any unrecognized value falls back to "exact" so a typo never silently
+        degrades quality.
+        """
+        if self.threshold_mode == "sample":
+            return self._compute_percentile_sampled(x, percentile)
+        return self._compute_percentile_chunked(x, percentile)
+
+    def _compute_percentile_sampled(self, x: torch.Tensor, percentile: float):
+        """Estimate the p-th percentile of |x| from a uniform random sample.
+
+        Draws `threshold_sample_size` elements uniformly at random (with a
+        fixed-seed CUDA generator for run-to-run reproducibility), takes abs in
+        float32, sorts the small sample, and reads off the percentile index.
+
+        Cost is O(n log n) on n = sample_size (default 2M) instead of O(N) abs +
+        O(collected log collected) sort on the full N = B*K (0.4-1B). Measured
+        ~0.33 ms vs 35-95 ms for the exact path, with threshold bias ~0.05-0.3 %
+        vs the TRUE percentile and run-to-run ratio std ~0.02-0.04 pp — both well
+        below the exact chunked method's own ~2.3 % bias (see __init__ rationale).
+
+        Args:
+            x:          Input tensor [B, K] (any float dtype / device).
+            percentile: Target percentile in [0, 1].
+
+        Returns:
+            threshold:  Scalar tensor (float32) on x.device.
+        """
+        x_flat = x.flatten()
+        N = x_flat.numel()
+        n = self.threshold_sample_size
+
+        if N <= n:
+            # Small enough: exact sort over the whole thing (no sampling error).
+            s = x_flat.abs().float()
+        else:
+            # Lazily build a device-resident, fixed-seed generator so the random
+            # indices are identical across runs on the same input -> deterministic
+            # generation. One generator per device is sufficient.
+            if self._thr_gen is None or self._thr_gen.device != x.device:
+                self._thr_gen = torch.Generator(device=x.device)
+                self._thr_gen.manual_seed(self.threshold_seed)
+            idx = torch.randint(0, N, (n,), device=x.device, generator=self._thr_gen)
+            s = x_flat[idx].abs().float()
+
+        sorted_s = torch.sort(s)[0]
+        i = int(percentile * sorted_s.numel())
+        i = min(i, sorted_s.numel() - 1)
+        return sorted_s[i]
 
     def _compute_percentile_chunked(self, x: torch.Tensor, percentile: float):
         """
@@ -270,7 +502,7 @@ class FFNOutlierRefiner:
             threshold: The computed threshold value (for profiling)
         """
         # Compute threshold using chunked processing (exact, no sampling)
-        threshold = self._compute_percentile_chunked(x, self.outlier_percentile)
+        threshold = self._compute_threshold(x, self.outlier_percentile)
 
         # Mark elements as outliers if they exceed threshold
         outlier_mask = x.abs() > threshold  # [B, K]
@@ -317,6 +549,180 @@ class FFNOutlierRefiner:
         # weight_bf16.T is [K, N]; non-contiguous is fine as the dense operand.
         return torch.mm(x_csr, weight_bf16.T)
 
+    # ------------------------------------------------------------------
+    # Channel-level (column) selection — structured sparsity
+    # ------------------------------------------------------------------
+    def _select_active_channels(self, x: torch.Tensor, threshold):
+        """Select the set of ACTIVE input channels (columns) for the BF16 path.
+
+        Unlike per-element selection (which marks individual elements and leaves
+        the GEMM dense), this returns a 1-D index tensor of channel ids. The BF16
+        correction then runs on x[:, S] @ W[:, S].T, cutting the contraction
+        dimension from K to |S| = M and therefore reducing FLOPs by M/K.
+
+        A channel is scored only on its OUTLIER elements (|x| > tau), so a channel
+        with one barely-over-threshold element ranks far below a channel with many
+        large outliers — this is exactly the "too loose" problem the per-element
+        definition has.
+
+        Args:
+            x:         [B, K] input activations (NVFP4-path dtype)
+            threshold: scalar tau from the percentile detector
+
+        Returns:
+            active_idx: 1-D LongTensor of active channel ids (possibly empty), on x.device
+        """
+        B, K = x.shape
+        x_abs = x.abs()
+        over = x_abs > threshold  # [B, K] bool — per-element outlier mask
+
+        mode = self.channel_select_mode
+        # Per-channel outlier element count: how many rows exceed tau in each column.
+        count = over.sum(dim=0)  # [K] int
+
+        if mode == "count_threshold":
+            # Active if a channel has at least N outlier elements.
+            active = count >= self.channel_count_n
+            active_idx = torch.nonzero(active, as_tuple=False).flatten()
+
+        elif mode == "mass_threshold":
+            # Active if the channel's peak magnitude clears alpha * tau.
+            peak = x_abs.amax(dim=0)  # [K]
+            active = peak >= (self.channel_alpha * float(threshold))
+            active_idx = torch.nonzero(active, as_tuple=False).flatten()
+
+        elif mode == "two_level":
+            # Both a count floor AND a magnitude ceiling must be satisfied.
+            peak = x_abs.amax(dim=0)
+            active = (count >= self.channel_count_n) & (peak >= (self.channel_alpha * float(threshold)))
+            active_idx = torch.nonzero(active, as_tuple=False).flatten()
+
+        else:  # "topm_mass" (default)
+            # Outlier-mass score: sum of |x| over outlier elements only.
+            # A channel ranks high only if it has MANY and LARGE outliers,
+            # subsuming the count + magnitude criteria into one scalar.
+            score = (x_abs * over).sum(dim=0)  # [K] float
+            # Fixed budget M = ceil(ratio * K) => deterministic FLOPs, contiguous gather.
+            m = max(1, int(self.channel_ratio * K + 0.999))
+            m = min(m, K)
+            # topk gives a STATICALLY-shaped [m] index tensor: its length is known on
+            # the host immediately, so nothing downstream (.numel(), index_select) ever
+            # forces a device->host sync. We deliberately do NOT filter zero-score
+            # picks: routing a no-outlier channel through BF16 is still numerically
+            # exact (it just moves that column from NVFP4 to BF16), and the old
+            # `(score>0).sum().item()` / boolean-index drop both trigger a per-call
+            # sync (nonzero under the hood) for a case that ~never fires at p~0.95.
+            active_idx = torch.topk(score, m, largest=True, sorted=False).indices
+
+        # Hard cap on M for the threshold-based modes (protect against pathological
+        # calls where almost every channel qualifies — keeps FLOPs bounded).
+        max_m = max(1, int(self.channel_max_ratio * K))
+        if active_idx.numel() > max_m and mode != "topm_mass":
+            # Keep the highest-mass channels among the qualifying set.
+            score = (x_abs * over).sum(dim=0)
+            sel = torch.topk(score[active_idx], max_m, largest=True, sorted=False).indices
+            active_idx = active_idx[sel]
+
+        return active_idx.to(torch.long)
+
+    def _apply_channel_refinement(
+        self,
+        x: torch.Tensor,
+        nvfp4_layer,
+        layer_name: str,
+        timestep: int = None,
+        actual_timestep: float = None,
+    ):
+        """Channel-level refinement path (structured column sparsity).
+
+        Decomposition (exact):
+            S = active channel set
+            y = NVFP4(W) @ x_main + b   +   W[:, S] @ x[:, S]
+        where x_main equals x with the active columns zeroed. Active columns are
+        therefore handled entirely in BF16 (whole column, not just outlier rows),
+        and inactive columns entirely in NVFP4.
+
+        The BF16 GEMM is a reduced-dimension dense matmul [B, M] x [M, N], so it
+        costs M/K of the full BF16 FFN instead of 1.0 (the per-element path).
+        """
+        self.stats["total_calls"] += 1
+
+        threshold = self._compute_threshold(x, self.outlier_percentile)
+        active_idx = self._select_active_channels(x, threshold)
+
+        K = x.shape[1]
+        m = int(active_idx.numel())
+        self.channel_calls += 1
+        self.channel_active_ratio_sum += (m / K) if K > 0 else 0.0
+
+        # Optional research profiling reuses the per-element mask definition so the
+        # numbers stay comparable to earlier runs. Only computed if requested.
+        if self.enable_channel_profiling or self.enable_channel_coverage_profiling:
+            outlier_mask = x.abs() > threshold
+            if self.enable_channel_profiling:
+                self._accumulate_channel_stats(outlier_mask, layer_name, timestep, actual_timestep)
+            if self.enable_channel_coverage_profiling:
+                self._current_profile_step = timestep
+                self._profile_channel_coverage(outlier_mask, layer_name)
+
+        if m == 0:
+            # No active channel — pure NVFP4, zero BF16 work.
+            return nvfp4_layer.apply(x)
+
+        # Main path: NVFP4 over x with active columns zeroed.
+        # Zeroing the high-magnitude columns also tightens the FP4 activation
+        # scale for the remaining columns (SmoothQuant-style side benefit).
+        x_main = x.clone()
+        x_main[:, active_idx] = 0
+        y_main = nvfp4_layer.apply(x_main)
+
+        # Correction path: reduced-dimension BF16 GEMM on active columns only.
+        weight_bf16, _bias = self._load_bf16_weight(layer_name)  # weight [N, K]
+        x_active = x.index_select(1, active_idx).to(torch.bfloat16)  # [B, M]
+        w_active = weight_bf16.index_select(1, active_idx)  # [N, M]
+        y_outlier = F.linear(x_active, w_active, bias=None).to(y_main.dtype)  # [B, N]
+
+        return y_main + y_outlier
+
+    def get_channel_select_stats(self):
+        """Average active-channel ratio across all channel-path calls."""
+        if self.channel_calls == 0:
+            return {"avg_active_channel_ratio": 0.0, "channel_calls": 0}
+        return {
+            "avg_active_channel_ratio": self.channel_active_ratio_sum / self.channel_calls,
+            "channel_calls": self.channel_calls,
+        }
+
+    def _maybe_dump_activation(self, x: torch.Tensor, layer_name: str, timestep):
+        """Save the raw FFN input activation to disk for offline threshold study.
+
+        Fully gated by `dump_activations` (default OFF). Saves the tensor BEFORE
+        any masking/splitting so the dump is the unmodified FFN input. Naming
+        matches what tools/bench_threshold_methods.py and
+        tools/analyze_threshold_stability.py parse:
+            blocks_{idx}_ffn_{0|2}_weight__step{step}.pt
+        e.g. layer_name "blocks.0.ffn.0.weight" -> "blocks_0_ffn_0_weight__step0.pt"
+
+        Only dumps for layers in `dump_layers` and steps < `dump_max_steps`.
+        """
+        if not self.dump_activations:
+            return
+        if timestep is None or timestep >= self.dump_max_steps:
+            return
+        # dump_layers entries are like "blocks.0.ffn.0" (no ".weight"); match prefix.
+        base = layer_name[: -len(".weight")] if layer_name.endswith(".weight") else layer_name
+        if base not in self.dump_layers:
+            return
+        fname = layer_name.replace(".", "_") + f"__step{int(timestep)}.pt"
+        path = os.path.join(self.dump_dir, fname)
+        if os.path.exists(path):
+            return  # one dump per (layer, step); cheap idempotence guard
+        try:
+            torch.save(x.detach().to(torch.bfloat16).cpu(), path)
+            logger.info(f"[FFN Outlier Refine] Dumped activation {fname} shape={tuple(x.shape)}")
+        except Exception as e:
+            logger.warning(f"[FFN Outlier Refine] Activation dump failed for {fname}: {e}")
+
     def apply_with_refinement(
         self,
         x: torch.Tensor,
@@ -341,6 +747,14 @@ class FFNOutlierRefiner:
         if not self.enable_refinement:
             return nvfp4_layer.apply(x)
 
+        # Offline study hook: dump the raw FFN input before any masking/splitting.
+        # Fully gated (default OFF); no effect on the dual-path math.
+        self._maybe_dump_activation(x, layer_name, timestep)
+
+        # Channel-level (structured column sparsity) path — reduces BF16 GEMM FLOPs.
+        if self.channel_mode_enabled:
+            return self._apply_channel_refinement(x, nvfp4_layer, layer_name, timestep, actual_timestep)
+
         self.stats["total_calls"] += 1
 
         # Step 1: Detect outlier elements (per-element selection)
@@ -356,6 +770,8 @@ class FFNOutlierRefiner:
         # Channel coverage profiling: measures per-call active-column fraction and
         # concentration metrics; accumulates on CPU for end-of-inference summary.
         if self.enable_channel_coverage_profiling:
+            # Track the current step so per-call records can be bucketed by timestep.
+            self._current_profile_step = timestep
             self._profile_channel_coverage(outlier_mask, layer_name)
 
         # Step 2: Split activations
@@ -500,6 +916,11 @@ class FFNOutlierRefiner:
                     "top10_sum": 0.0,
                     # For per-call logging: store (B, K, shape_str) once
                     "shape_example": f"({B}, {K})",
+                    # Per-call records for distribution / histogram analysis.
+                    "per_call_active_cols": [],
+                    "per_call_col_cov": [],
+                    "per_call_top5": [],
+                    "per_call_step": [],
                 }
 
             acc = self.channel_coverage_stats[layer_name]
@@ -515,6 +936,14 @@ class FFNOutlierRefiner:
             acc["top1_sum"]         += top1
             acc["top5_sum"]         += top5
             acc["top10_sum"]        += top10
+
+            # --- Per-call records for distribution stats (P50/P95/max/min/hist) ---
+            # Lightweight: a few Python floats per call. With ~10 FFN calls/step
+            # × infer_steps × 2 (cfg) this stays tiny.
+            acc["per_call_active_cols"].append(active_cols)
+            acc["per_call_col_cov"].append(col_coverage)
+            acc["per_call_top5"].append(top5)
+            acc["per_call_step"].append(int(getattr(self, "_current_profile_step", -1)))
 
             # Per-call log (verbose, one line per FFN call).
             logger.debug(
@@ -581,6 +1010,38 @@ class FFNOutlierRefiner:
             logger.info(f"    Top  5% channels cover: {avg_top5:.2%}")
             logger.info(f"    Top 10% channels cover: {avg_top10:.2%}")
 
+            # --- Per-call distribution of active-column coverage ---
+            # This is the decisive number: does per-call coverage stay near
+            # 100% (gather useless) or sit well below (gather viable)?
+            cov_list = sorted(acc.get("per_call_col_cov", []))
+            ac_list = sorted(acc.get("per_call_active_cols", []))
+            if cov_list:
+                def _pct(sorted_vals, q):
+                    if not sorted_vals:
+                        return 0.0
+                    i = min(len(sorted_vals) - 1, int(q * len(sorted_vals)))
+                    return sorted_vals[i]
+                cov_p50 = _pct(cov_list, 0.50)
+                cov_p95 = _pct(cov_list, 0.95)
+                cov_min = cov_list[0]
+                cov_max = cov_list[-1]
+                ac_p50 = _pct(ac_list, 0.50)
+                ac_p95 = _pct(ac_list, 0.95)
+                logger.info(f"  Active-Column COVERAGE distribution over {len(cov_list)} calls:")
+                logger.info(f"    coverage  min={cov_min:.2%}  P50={cov_p50:.2%}  "
+                            f"P95={cov_p95:.2%}  max={cov_max:.2%}")
+                logger.info(f"    active_cols  min={ac_list[0]}  P50={ac_p50:.0f}  "
+                            f"P95={ac_p95:.0f}  max={ac_list[-1]}  / {K}")
+                # Coarse histogram of per-call coverage (10% bins).
+                bins = [0] * 10
+                for c in cov_list:
+                    b = min(9, int(c * 10))
+                    bins[b] += 1
+                hist_str = "  ".join(
+                    f"[{i*10}-{i*10+10}%]:{bins[i]}" for i in range(10) if bins[i] > 0
+                )
+                logger.info(f"    coverage histogram: {hist_str}")
+
         logger.info(sep)
         logger.info("[Grand Average Across All Layers]")
         import statistics
@@ -590,6 +1051,29 @@ class FFNOutlierRefiner:
         logger.info(f"  Avg Top-5%  Coverage: {statistics.mean(global_top5):.2%}")
         logger.info(f"  Avg Top-10% Coverage: {statistics.mean(global_top10):.2%}")
         logger.info(sep)
+
+        # Dump full per-call records to JSON for offline distribution analysis.
+        try:
+            import json, os, time
+            out_dir = "outputs/sparsity_analysis"
+            os.makedirs(out_dir, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            dump = {}
+            for layer_name, acc in self.channel_coverage_stats.items():
+                dump[layer_name] = {
+                    "K": acc["K"],
+                    "calls": acc["calls"],
+                    "per_call_active_cols": acc.get("per_call_active_cols", []),
+                    "per_call_col_cov": acc.get("per_call_col_cov", []),
+                    "per_call_top5": acc.get("per_call_top5", []),
+                    "per_call_step": acc.get("per_call_step", []),
+                }
+            path = os.path.join(out_dir, f"channel_coverage_percall_{ts}.json")
+            with open(path, "w") as f:
+                json.dump(dump, f)
+            logger.info(f"[Outlier Channel Coverage] Per-call records saved to {path}")
+        except Exception as e:
+            logger.warning(f"[Outlier Channel Coverage] Failed to dump per-call JSON: {e}")
 
     def _accumulate_channel_stats(self, outlier_mask, layer_name, timestep=None, actual_timestep=None):
         """Accumulate per-channel outlier counts on GPU (no CPU copy).

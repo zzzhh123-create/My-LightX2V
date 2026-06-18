@@ -267,6 +267,27 @@ def main():
         except Exception as e:
             logger.warning(f"Failed to print channel coverage summary: {e}")
 
+    # Print channel-selection (structured column sparsity) stats if enabled
+    if config.get("ffn_outlier_refinement", {}).get("channel_selection", {}).get("enable", False):
+        try:
+            model = runner.model if hasattr(runner, "model") else None
+            if model is not None:
+                models = model if isinstance(model, list) else [model]
+                for model_instance in models:
+                    if hasattr(model_instance, "transformer_infer") and hasattr(model_instance.transformer_infer, "ffn_outlier_refiner"):
+                        refiner = model_instance.transformer_infer.ffn_outlier_refiner
+                        if refiner is not None and getattr(refiner, "channel_mode_enabled", False):
+                            cs = refiner.get_channel_select_stats()
+                            logger.info(
+                                f"[FFN Channel Refine] mode={refiner.channel_select_mode} "
+                                f"avg_active_channel_ratio={cs['avg_active_channel_ratio']:.2%} "
+                                f"(BF16 GEMM FLOPs = {cs['avg_active_channel_ratio']:.2%} of full BF16 FFN) "
+                                f"over {cs['channel_calls']} calls"
+                            )
+                            break
+        except Exception as e:
+            logger.warning(f"Failed to print channel-selection summary: {e}")
+
     # Clean up distributed process group
     if dist.is_initialized():
         dist.destroy_process_group()
