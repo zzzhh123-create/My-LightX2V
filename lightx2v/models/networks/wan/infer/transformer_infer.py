@@ -1,6 +1,7 @@
 from functools import partial
 
 import torch
+from loguru import logger
 
 from lightx2v.common.transformer_infer.transformer_infer import BaseTransformerInfer
 from lightx2v.utils.envs import *
@@ -91,6 +92,7 @@ class WanTransformerInfer(BaseTransformerInfer):
                 save_full_channel_histogram=config["ffn_outlier_refinement"].get("save_full_channel_histogram", True),
                 enable_sparse_bf16=config["ffn_outlier_refinement"].get("enable_sparse_bf16", False),
                 channel_selection=config["ffn_outlier_refinement"].get("channel_selection", None),
+                bf16_routing_v2=config["ffn_outlier_refinement"].get("bf16_routing_v2", None),
                 threshold_mode=config["ffn_outlier_refinement"].get("threshold_mode", "sample"),
                 threshold_sample_size=config["ffn_outlier_refinement"].get("threshold_sample_size", 2_000_000),
                 threshold_seed=config["ffn_outlier_refinement"].get("threshold_seed", 0),
@@ -105,14 +107,39 @@ class WanTransformerInfer(BaseTransformerInfer):
         # Actual scheduler timestep value (e.g. ~1000..0) for channel profiling.
         self.current_actual_timestep = None
 
+        # ---- Cross-attention K/V cache (math-preserving, opt-in) -------------
+        # The cross-attn key/value projections consume ONLY `context` (text emb)
+        # / `context_img` (clip projection) through STATIC MM + static RMSNorm —
+        # no timestep, no latent x. Therefore:
+        #   * text  k/v depend only on (block_idx, infer_condition): invariant
+        #     across all 40 diffusion steps; 2 contexts -> 80 unique tensors.
+        #   * image k_img/v_img depend only on block_idx: invariant across steps
+        #     AND across the cond/uncond passes -> 40 unique tensors.
+        # The query q stays per-step (depends on x) and is never cached.
+        # Reuse is BIT-IDENTICAL, not approximate. Default OFF because the cache
+        # is ~1.3 GB resident and would fight clean_cuda_cache's memory intent.
+        # Invalidation: step_index == 0 always recomputes + overwrites, so every
+        # fresh generation (which starts at step 0) self-refreshes; no explicit
+        # clear needed.
+        self.cache_cross_attn_kv = config.get("cache_cross_attn_kv", False)
+        self._cross_kv_cache = {}
+
     @torch.no_grad()
-    def preload_ffn_bf16_weights(self):
+    def preload_ffn_bf16_weights(self, transformer_weights=None):
         """Eagerly load every FFN BF16 correction weight into the GPU cache.
 
         Mirrors the NVFP4 weights being resident before inference starts: called
         once before the first scheduler step so the BF16 outlier/channel path
         never stalls on a lazy load during step 0. Idempotent — subsequent calls
         are no-ops because the weights are already cached.
+
+        Also handles two related v2-routing setup steps when configured:
+          1. Load the PBS (Per-Block Static) schedule from JSON — replaces the
+             runtime channel scoring with a precomputed static channel set per
+             layer (eliminates threshold + channel_score_fused + topk).
+          2. Prepare 2:4 semi-structured sparse compressed weights for the BF16
+             reduced GEMM (~1.3-1.6× speedup on the BF16 outlier path).
+        Both are gated by config flags and no-op when disabled.
         """
         if self.ffn_outlier_refiner is None:
             return
@@ -121,6 +148,106 @@ class WanTransformerInfer(BaseTransformerInfer):
             layer_names.append(f"blocks.{i}.ffn.0.weight")
             layer_names.append(f"blocks.{i}.ffn.2.weight")
         self.ffn_outlier_refiner.preload_bf16_weights(layer_names)
+
+        # ---- Hot-column + cold-tail rotation path (independent of PBS) -------
+        # A separate full-K delta correction path. When enabled it OVERRIDES the
+        # v2 / channel / per-element paths at runtime, so we build ONLY its cache
+        # here and return early (no PBS schedule / sparse-S / dense-gather prep).
+        if getattr(self.ffn_outlier_refiner, "hotcol_enabled", False):
+            # Stash clip/sigma for the v2.1 column-order score (image-conditioned).
+            self.ffn_outlier_refiner._hotcol_clip_fea = getattr(self, "current_clip_fea", None)
+            self.ffn_outlier_refiner._hotcol_sigma_norms = getattr(self, "current_sigma_norms", None)
+            # Build the {layer_name: nvfp4_MMWeight} map (kernel-oracle for Q).
+            nvfp4_layers = None
+            if transformer_weights is not None:
+                nvfp4_layers = {}
+                try:
+                    for i in range(self.blocks_num):
+                        phase = transformer_weights.blocks[i].compute_phases[2]
+                        for sub, name in (("ffn_0", f"blocks.{i}.ffn.0.weight"),
+                                          ("ffn_2", f"blocks.{i}.ffn.2.weight")):
+                            layer = getattr(phase, sub, None)
+                            if layer is not None:
+                                nvfp4_layers[name] = layer
+                except Exception as e:
+                    logger.warning(f"[Hotcol] could not build nvfp4 layer map ({e}); layers will be uncorrected")
+                    nvfp4_layers = None
+            self.ffn_outlier_refiner.prepare_hotcol_rotation(layer_names, nvfp4_layers=nvfp4_layers)
+            # prepare_hotcol_rotation drops each layer's full dense [N,K] weight
+            # right after extracting its per-block deltas, so the dense cache is
+            # already reclaimed. Just empty the allocator cache.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return
+
+        # PBS v2.0 (analytic): build S = f(clip_emb, sigma, W) once, here, BEFORE
+        # the sparse/gather prep steps consume `pbs_schedule`. Takes precedence
+        # over loading a JSON schedule. Signal set is strictly (clip_emb, sigma,
+        # W); the hot path afterwards is the same pbs_schedule[layer] lookup.
+        # sigma_norms / clip_emb are stashed on transformer_infer by model.infer
+        # (both optional — with the image term OFF, only sigmas are used).
+        if getattr(self.ffn_outlier_refiner, "pbs_build_v2", False):
+            # clip feature: raw [n_tok, d_clip]. Used either by the cross_attn
+            # extractor (runs ImgProj+Vimg+O itself) or mean-pooled for the
+            # independent projection. Stashed by model.infer at step 0.
+            self.ffn_outlier_refiner.build_pbs_v2_schedule(
+                layer_names,
+                clip_emb=getattr(self, "current_clip_fea", None),
+                sigma_norms=getattr(self, "current_sigma_norms", None),
+            )
+        else:
+            # Load PBS static schedule (if configured) — must come AFTER BF16
+            # preload so the W column-norm cache is consistent.
+            pbs_path = getattr(self.ffn_outlier_refiner, "v2_pbs_schedule_path", None)
+            if pbs_path:
+                self.ffn_outlier_refiner.load_pbs_schedule(pbs_path)
+
+        # Prepare sparse compressed weights (if configured AND PBS is loaded).
+        # Note: layers matching `sparse_skip_patterns` are intentionally NOT
+        # added to the sparse cache; they fall through to the dense PBS path.
+        if (
+            getattr(self.ffn_outlier_refiner, "pbs_sparse_gemm", False)
+            and self.ffn_outlier_refiner.pbs_schedule
+        ):
+            # Build the {layer_name: nvfp4_MMWeight} map for the delta-vs-NVFP4
+            # decomposition (only used when `sparse_delta_nvfp4` is on). The
+            # ffn_0 / ffn_2 MMWeight objects live on each block's 3rd compute
+            # phase. Passing the actual runtime objects guarantees the recovered
+            # Q matches the kernel byte-for-byte (kernel-as-oracle). Best-effort:
+            # if the structure differs, the map stays empty and prepare falls
+            # back to plain replacement.
+            nvfp4_layers = None
+            if getattr(self.ffn_outlier_refiner, "sparse_delta_nvfp4", False) and transformer_weights is not None:
+                nvfp4_layers = {}
+                try:
+                    for i in range(self.blocks_num):
+                        phase = transformer_weights.blocks[i].compute_phases[2]
+                        for sub, name in (("ffn_0", f"blocks.{i}.ffn.0.weight"),
+                                          ("ffn_2", f"blocks.{i}.ffn.2.weight")):
+                            layer = getattr(phase, sub, None)
+                            if layer is not None:
+                                nvfp4_layers[name] = layer
+                except Exception as e:
+                    logger.warning(f"[Delta NVFP4] could not build nvfp4 layer map ({e}); using replacement")
+                    nvfp4_layers = None
+            self.ffn_outlier_refiner.prepare_sparse_gemm_weights(nvfp4_layers=nvfp4_layers)
+
+        # Pre-gather dense W[:, S] for every PBS layer NOT covered by the
+        # sparse cache (either because sparse is off entirely, or the layer
+        # is in `sparse_skip_patterns`). Eliminates the per-call
+        # `weight_bf16.index_select(1, active_idx)` cost (~0.5-1 ms / call,
+        # ~40-80 ms / step over 80 FFN positions × CFG).
+        if self.ffn_outlier_refiner.pbs_schedule:
+            self.ffn_outlier_refiner.prepare_pbs_dense_gather()
+
+        # Free the redundant full dense [N, K] BF16 cache once every PBS layer
+        # is covered by either the sparse cache or the pre-gathered W[:, S].
+        # On the PBS hot path the full dense weight is never read again, so
+        # holding all 80 FFN weights (~11 GB at Wan 14B) is pure dead memory —
+        # the single biggest contributor to the r100 OOM. Startup-only; no
+        # effect on per-step latency.
+        if self.ffn_outlier_refiner.pbs_schedule:
+            self.ffn_outlier_refiner.free_redundant_dense_cache()
 
     @torch.no_grad()
     def reset_post_adapter_states(self):
@@ -309,8 +436,26 @@ class WanTransformerInfer(BaseTransformerInfer):
 
         n, d = self.num_heads, self.head_dim
         q = phase.cross_attn_norm_q.apply(phase.cross_attn_q.apply(norm3_out)).view(-1, n, d)
-        k = phase.cross_attn_norm_k.apply(phase.cross_attn_k.apply(context)).view(-1, n, d)
-        v = phase.cross_attn_v.apply(context).view(-1, n, d)
+
+        # ---- Cross-attn K/V: cached when enabled (bit-identical reuse) -------
+        # k/v depend ONLY on `context` (no x, no timestep) -> invariant across
+        # diffusion steps. Cache key folds in infer_condition (cond vs uncond
+        # use different text context). step_index==0 always recomputes so a new
+        # generation self-refreshes the cache. q is recomputed every step.
+        kv_cache_on = self.cache_cross_attn_kv and getattr(self, "scheduler", None) is not None
+        if kv_cache_on:
+            step0 = self.scheduler.step_index == 0
+            txt_key = (self.block_idx, bool(self.scheduler.infer_condition), "txt")
+            cached = None if step0 else self._cross_kv_cache.get(txt_key)
+            if cached is None:
+                k = phase.cross_attn_norm_k.apply(phase.cross_attn_k.apply(context)).view(-1, n, d)
+                v = phase.cross_attn_v.apply(context).view(-1, n, d)
+                self._cross_kv_cache[txt_key] = (k, v)
+            else:
+                k, v = cached
+        else:
+            k = phase.cross_attn_norm_k.apply(phase.cross_attn_k.apply(context)).view(-1, n, d)
+            v = phase.cross_attn_v.apply(context).view(-1, n, d)
 
         if self.cross_attn_cu_seqlens_q is None:
             if self.cross_attn_1_type == "flash_attn2" or self.cross_attn_1_type == "flash_attn3":
@@ -333,8 +478,20 @@ class WanTransformerInfer(BaseTransformerInfer):
         )
 
         if self.task in ["i2v", "flf2v", "animate", "s2v", "rs2v"] and self.config.get("use_image_encoder", True) and context_img is not None:
-            k_img = phase.cross_attn_norm_k_img.apply(phase.cross_attn_k_img.apply(context_img)).view(-1, n, d)
-            v_img = phase.cross_attn_v_img.apply(context_img).view(-1, n, d)
+            # image k/v depend ONLY on context_img (clip projection) -> invariant
+            # across steps AND across cond/uncond passes. Cache key = block_idx.
+            if kv_cache_on:
+                img_key = (self.block_idx, "img")
+                cached_img = None if self.scheduler.step_index == 0 else self._cross_kv_cache.get(img_key)
+                if cached_img is None:
+                    k_img = phase.cross_attn_norm_k_img.apply(phase.cross_attn_k_img.apply(context_img)).view(-1, n, d)
+                    v_img = phase.cross_attn_v_img.apply(context_img).view(-1, n, d)
+                    self._cross_kv_cache[img_key] = (k_img, v_img)
+                else:
+                    k_img, v_img = cached_img
+            else:
+                k_img = phase.cross_attn_norm_k_img.apply(phase.cross_attn_k_img.apply(context_img)).view(-1, n, d)
+                v_img = phase.cross_attn_v_img.apply(context_img).view(-1, n, d)
 
             if self.cross_attn_cu_seqlens_kv_img is None:
                 if self.cross_attn_2_type == "flash_attn2" or self.cross_attn_2_type == "flash_attn3":
@@ -391,7 +548,8 @@ class WanTransformerInfer(BaseTransformerInfer):
         if self.ffn_outlier_refiner is not None:
             ffn_0_layer_name = f"blocks.{self.block_idx}.ffn.0.weight"
             y = self.ffn_outlier_refiner.apply_with_refinement(
-                norm2_out, phase.ffn_0, ffn_0_layer_name, timestep=self.current_timestep, actual_timestep=self.current_actual_timestep
+                norm2_out, phase.ffn_0, ffn_0_layer_name, timestep=self.current_timestep, actual_timestep=self.current_actual_timestep,
+                cond=bool(getattr(self.scheduler, "infer_condition", True)),
             )
         else:
             y = phase.ffn_0.apply(norm2_out)
@@ -403,11 +561,64 @@ class WanTransformerInfer(BaseTransformerInfer):
         if self.clean_cuda_cache:
             torch.cuda.empty_cache()
 
+        # ---- Cross-step error-coherence capture (research, env-gated) -------
+        # Dumps the post-GELU ffn.2 INPUT x_t for ONE target block across every
+        # step, with a FIXED row subsample (so e_{t+1}-e_t is per-token aligned).
+        # Offline we form e_t = D @ x_t (D = B - Q) and measure temporal coherence.
+        # Zero effect when LIGHTX2V_ECOH_DUMP is unset.
+        import os as _os
+        if _os.getenv("LIGHTX2V_ECOH_DUMP", "0") == "1":
+            _tgt = int(_os.getenv("LIGHTX2V_ECOH_BLOCK", "20"))
+            if self.block_idx == _tgt and self.scheduler.infer_condition:
+                _dir = _os.getenv("LIGHTX2V_ECOH_DIR", "/root/autodl-tmp/LightX2V/ecoh_dump")
+                _os.makedirs(_dir, exist_ok=True)
+                _si = self.scheduler.step_index
+                _B = y.shape[0]
+                _mode = _os.getenv("LIGHTX2V_ECOH_MODE", "random")
+                if _mode == "frame":
+                    # Frame-structured sampling: dump the SAME spatial positions p
+                    # across ALL T' frames so offline we can reshape to
+                    # [frames, n_spatial, K] and measure temporal coherence of the
+                    # NVFP4 correction c_{(t,p)} = (B-Q) x_{(t,p)} along the frame axis.
+                    # Token layout is C-order: b = t * spatial_total + p.
+                    _frames = int(_os.getenv("LIGHTX2V_ECOH_FRAMES", "21"))
+                    _spatial_total = _B // _frames
+                    _nsp = int(_os.getenv("LIGHTX2V_ECOH_SPATIAL", "256"))
+                    _nsp = min(_nsp, _spatial_total)
+                    # Evenly spaced spatial positions (deterministic across steps).
+                    _pos = torch.linspace(0, _spatial_total - 1, _nsp).round().long()
+                    # rows[t, j] = t * spatial_total + _pos[j]
+                    _t = torch.arange(_frames).view(_frames, 1)
+                    _rows2d = (_t * _spatial_total + _pos.view(1, _nsp))  # [frames, nsp]
+                    _ridx = _rows2d.reshape(-1)  # [frames*nsp], frame-major
+                    torch.save(
+                        {
+                            "x": y.detach()[_ridx.to(y.device)].float().cpu(),  # [frames*nsp, K]
+                            "rows": _ridx,
+                            "pos": _pos,
+                            "frames": _frames,
+                            "spatial_total": _spatial_total,
+                            "n_spatial": _nsp,
+                            "layout": "frame_major",  # x[t*nsp + j] = token (frame t, pos _pos[j])
+                            "step": _si,
+                        },
+                        _os.path.join(_dir, f"ecohf_b{_tgt}_s{_si:03d}.pt"),
+                    )
+                else:
+                    _nrow = int(_os.getenv("LIGHTX2V_ECOH_ROWS", "512"))
+                    _g = torch.Generator(device="cpu").manual_seed(1234)
+                    _ridx = torch.randperm(_B, generator=_g)[:_nrow]
+                    torch.save(
+                        {"x": y.detach()[_ridx.to(y.device)].float().cpu(), "rows": _ridx, "step": _si},
+                        _os.path.join(_dir, f"ecoh_b{_tgt}_s{_si:03d}.pt"),
+                    )
+
         # FFN layer 2 with optional outlier refinement
         if self.ffn_outlier_refiner is not None:
             ffn_2_layer_name = f"blocks.{self.block_idx}.ffn.2.weight"
             y = self.ffn_outlier_refiner.apply_with_refinement(
-                y, phase.ffn_2, ffn_2_layer_name, timestep=self.current_timestep, actual_timestep=self.current_actual_timestep
+                y, phase.ffn_2, ffn_2_layer_name, timestep=self.current_timestep, actual_timestep=self.current_actual_timestep,
+                cond=bool(getattr(self.scheduler, "infer_condition", True)),
             )
         else:
             y = phase.ffn_2.apply(y)

@@ -172,7 +172,52 @@ class WanModel(BaseTransformerModel):
         # outlier/channel BF16 path is resident up front (like the NVFP4 weights),
         # instead of paying lazy-load stalls on the first FFN call. Idempotent.
         if self.scheduler.step_index == 0 and hasattr(self.transformer_infer, "preload_ffn_bf16_weights"):
-            self.transformer_infer.preload_ffn_bf16_weights()
+            # PBS v2.0: expose the normalized noise schedule (sigma) to the
+            # refiner so the analytic step-0 schedule build can use the single
+            # sigma scalar lam = 1 - mean(sigma_norm). Signal set stays
+            # (clip_emb, sigma, W); this only forwards sigma. Best-effort.
+            try:
+                sigmas = getattr(self.scheduler, "sigmas", None)
+                if sigmas is not None:
+                    sig = sigmas.detach().float().flatten()
+                    smax = float(sig.max())
+                    self.transformer_infer.current_sigma_norms = (sig / smax) if smax > 0 else sig
+            except Exception:
+                self.transformer_infer.current_sigma_norms = None
+            # PBS v2.1: forward the RAW image CLIP feature so the step-0
+            # cross-attention feature extractor (run ONCE, off-loop) can build
+            # the image-coupled channel importance. Best-effort; absent for t2v
+            # or when use_image_encoder is off -> image term simply stays off.
+            try:
+                self.transformer_infer.current_clip_fea = (
+                    inputs.get("image_encoder_output", {}).get("clip_encoder_out", None)
+                )
+            except Exception:
+                self.transformer_infer.current_clip_fea = None
+            # Optional dump for offline PBS-score benchmarking. Writes the RAW
+            # clip_fea (and sigma_norms) exactly as consumed by the v2.1 image
+            # extractor, once, at step 0. Enabled only via LIGHTX2V_DUMP_CLIP_FEA.
+            import os as _os
+            if _os.environ.get("LIGHTX2V_DUMP_CLIP_FEA"):
+                try:
+                    _dir = _os.environ.get(
+                        "LIGHTX2V_CLIP_FEA_DIR",
+                        "/root/autodl-tmp/LightX2V/outputs/ffn_act_dump",
+                    )
+                    _os.makedirs(_dir, exist_ok=True)
+                    _cf = self.transformer_infer.current_clip_fea
+                    _sn = getattr(self.transformer_infer, "current_sigma_norms", None)
+                    torch.save(
+                        {
+                            "clip_fea": _cf.detach().cpu() if _cf is not None else None,
+                            "sigma_norms": _sn.detach().cpu() if _sn is not None else None,
+                        },
+                        _os.path.join(_dir, "pbs_clip_fea_step0.pt"),
+                    )
+                    logger.info(f"[DUMP] clip_fea + sigma_norms saved to {_dir}/pbs_clip_fea_step0.pt")
+                except Exception as _e:
+                    logger.warning(f"[DUMP] clip_fea dump failed: {_e}")
+            self.transformer_infer.preload_ffn_bf16_weights(self.transformer_weights)
 
         if self.cpu_offload:
             if self.offload_granularity == "model" and self.scheduler.step_index == 0 and "wan2.2_moe" not in self.config["model_cls"]:

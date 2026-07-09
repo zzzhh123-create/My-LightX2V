@@ -288,6 +288,37 @@ def main():
         except Exception as e:
             logger.warning(f"Failed to print channel-selection summary: {e}")
 
+    # Print v2 routing (W-coupled + bi-axis) stats if enabled. Independent
+    # block: v2 lives outside the channel_selection sub-config so it never
+    # collides with the channel-based / hybrid baselines.
+    if config.get("ffn_outlier_refinement", {}).get("bf16_routing_v2", {}).get("enable", False):
+        try:
+            model = runner.model if hasattr(runner, "model") else None
+            if model is not None:
+                models = model if isinstance(model, list) else [model]
+                for model_instance in models:
+                    if hasattr(model_instance, "transformer_infer") and hasattr(model_instance.transformer_infer, "ffn_outlier_refiner"):
+                        refiner = model_instance.transformer_infer.ffn_outlier_refiner
+                        if refiner is not None and getattr(refiner, "v2_enabled", False):
+                            v2s = refiner.get_v2_routing_stats()
+                            adaptive_tag = ""
+                            if v2s.get("adaptive_enabled"):
+                                adaptive_tag = (
+                                    f" adaptive_budget=on M_floor_hits={v2s['M_floor_hit_rate']:.1%} "
+                                    f"T_floor_hits={v2s['T_floor_hit_rate']:.1%}"
+                                )
+                            logger.info(
+                                f"[FFN Routing v2] strategy={refiner.v2_channel_strategy} "
+                                f"granularity={refiner.v2_bf16_granularity} "
+                                f"avg_M/K={v2s['avg_channel_ratio']:.2%} "
+                                f"avg_T/B={v2s['avg_token_ratio']:.2%} "
+                                f"BF16-FLOP fraction={v2s['avg_flop_frac']:.2%} of full BF16 FFN "
+                                f"over {v2s['v2_calls']} calls{adaptive_tag}"
+                            )
+                            break
+        except Exception as e:
+            logger.warning(f"Failed to print v2 routing summary: {e}")
+
     # Clean up distributed process group
     if dist.is_initialized():
         dist.destroy_process_group()
