@@ -97,6 +97,11 @@ class QwenImageTransformerModel(BaseTransformerModel):
                 self.pre_weight.to_cuda()
                 self.post_weight.to_cuda()
 
+        # On the very first step, eagerly load all BF16 MLP weights and build
+        # the hotcol pool. Idempotent — no-op on subsequent steps.
+        if self.scheduler.step_index == 0 and hasattr(self.transformer_infer, "preload_ffn_bf16_weights"):
+            self.transformer_infer.preload_ffn_bf16_weights(self.transformer_weights)
+
         latents = self.scheduler.latents
         if self.config["task"] == "i2i":
             image_latents = torch.cat([item["image_latents"] for item in inputs["image_encoder_output"]], dim=1)

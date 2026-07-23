@@ -1,7 +1,9 @@
 import torch
 import torch.nn.functional as F
+from loguru import logger
 
 from lightx2v.common.transformer_infer.transformer_infer import BaseTransformerInfer
+from lightx2v.models.networks.wan.infer.ffn_outlier_refine import FFNOutlierRefiner
 
 from .triton_ops import (
     fuse_scale_shift_gate_select01_kernel,
@@ -51,6 +53,42 @@ class QwenImageTransformerInfer(BaseTransformerInfer):
         self.cu_seqlens_qkv1 = None
         self.img_qkv_len2 = None
         self.cu_seqlens_qkv2 = None
+
+        # ---- Hotcol BF16 compensation (mirrors Wan2.1 transformer_infer) -----
+        # Qwen Image has 4 MLP layers per block (img/txt × mlp_0/mlp_2), all of
+        # which are NVFP4 quantized. The same column-granular replacement strategy
+        # applies: top-H columns are zeroed in x, then a skinny BF16 GEMM adds
+        # them back at full precision, recovering both weight and activation quant
+        # error simultaneously. Layer names use the checkpoint key convention:
+        #   transformer_blocks.{i}.img_mlp.net.{0|2}.proj.weight   (img stream)
+        #   transformer_blocks.{i}.txt_mlp.net.{0|2}.proj.weight   (txt stream)
+        self.blocks_num = config.get("num_layers", 60)
+        self.ffn_outlier_refiner = None
+        if config.get("ffn_outlier_refinement", {}).get("enable", False):
+            r = config["ffn_outlier_refinement"]
+            self.ffn_outlier_refiner = FFNOutlierRefiner(
+                outlier_percentile=r.get("outlier_percentile", 0.95),
+                bf16_weight_path=r.get("bf16_weight_path"),
+                enable_refinement=True,
+                enable_profiling=r.get("enable_profiling", False),
+                enable_channel_profiling=r.get("enable_channel_profiling", False),
+                enable_channel_coverage_profiling=r.get("enable_channel_coverage_profiling", False),
+                infer_steps=config.get("infer_steps"),
+                save_full_channel_histogram=r.get("save_full_channel_histogram", True),
+                enable_sparse_bf16=r.get("enable_sparse_bf16", False),
+                channel_selection=r.get("channel_selection", None),
+                bf16_routing_v2=r.get("bf16_routing_v2", None),
+                threshold_mode=r.get("threshold_mode", "sample"),
+                threshold_sample_size=r.get("threshold_sample_size", 2_000_000),
+                threshold_seed=r.get("threshold_seed", 0),
+                dump_activations=r.get("dump_activations", False),
+                dump_dir=r.get("dump_dir", "outputs/ffn_act_dump"),
+                dump_layers=r.get("dump_layers", None),
+                dump_max_steps=r.get("dump_max_steps", 4),
+            )
+        # Current diffusion step index, updated by preload_ffn_bf16_weights caller.
+        self.current_timestep = 0
+        self.current_actual_timestep = None
 
     def set_scheduler(self, scheduler):
         self.scheduler = scheduler
@@ -255,20 +293,81 @@ class QwenImageTransformerInfer(BaseTransformerInfer):
         txt_mod2,
         modulate_index=None,
     ):
-        """Apply second modulation and FFN to both streams (compute_phases[4])"""
-        # Process image stream - norm2 + MLP
+        """Apply second modulation and FFN to both streams (compute_phases[3]).
+
+        When ffn_outlier_refiner is active (hotcol mode), each of the four MLP
+        GEMM calls is replaced by the column-granular replacement path:
+          1. Top-H columns are zeroed in x so NVFP4 only sees the remaining ones.
+          2. A skinny BF16 GEMM adds them back at full precision.
+        This recovers both weight- and activation-quant error simultaneously at
+        ~23% of full-BF16 latency cost (same rationale as Wan2.1).
+
+        Layer-name convention (matches BF16 safetensors checkpoint keys):
+          transformer_blocks.{i}.img_mlp.net.0.proj.weight  (img up-proj)
+          transformer_blocks.{i}.img_mlp.net.2.weight       (img down-proj)
+          transformer_blocks.{i}.txt_mlp.net.0.proj.weight  (txt up-proj)
+          transformer_blocks.{i}.txt_mlp.net.2.weight       (txt down-proj)
+
+        block_idx is read from self.block_idx, which is set by infer_block
+        (non-offload) and by the offload loop (infer_with_blocks/phases_offload)
+        before each infer_ffn call.  This avoids relying on cuda_buffers'
+        block_index attribute, which is not updated across the offload cycle.
+        """
+        # Pre-compute timestep / cond / block index once per block.
+        if self.ffn_outlier_refiner is not None:
+            block_idx = getattr(self, "block_idx", 0)
+            ts = getattr(self.scheduler, "step_index", 0)
+            cond = bool(getattr(self.scheduler, "infer_condition", True))
+
+        # ---- image stream: norm2 → mlp_0 → GELU → mlp_2 → residual ----
         img_normed2 = ffn_phase.img_norm2.apply(hidden_states)
         img_modulated2, img_gate2 = self._modulate(img_normed2, img_mod2, modulate_index)
-        img_mlp_output = F.gelu(ffn_phase.img_mlp_0.apply(img_modulated2.squeeze(0)), approximate="tanh")
-        img_mlp_output = ffn_phase.img_mlp_2.apply(img_mlp_output)
-        hidden_states = hidden_states + img_gate2 * img_mlp_output
+        x_img = img_modulated2.squeeze(0)
 
-        # Process text stream - norm2 + MLP
+        if self.ffn_outlier_refiner is not None:
+            x_img = self.ffn_outlier_refiner.apply_with_refinement(
+                x_img, ffn_phase.img_mlp_0,
+                f"transformer_blocks.{block_idx}.img_mlp.net.0.proj.weight",
+                timestep=ts, actual_timestep=None, cond=cond,
+            )
+        else:
+            x_img = ffn_phase.img_mlp_0.apply(x_img)
+        x_img = F.gelu(x_img, approximate="tanh")
+
+        if self.ffn_outlier_refiner is not None:
+            x_img = self.ffn_outlier_refiner.apply_with_refinement(
+                x_img, ffn_phase.img_mlp_2,
+                f"transformer_blocks.{block_idx}.img_mlp.net.2.weight",
+                timestep=ts, actual_timestep=None, cond=cond,
+            )
+        else:
+            x_img = ffn_phase.img_mlp_2.apply(x_img)
+        hidden_states = hidden_states + img_gate2 * x_img
+
+        # ---- text stream: norm2 → mlp_0 → GELU → mlp_2 → residual ----
         txt_normed2 = ffn_phase.txt_norm2.apply(encoder_hidden_states)
         txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
-        txt_mlp_output = F.gelu(ffn_phase.txt_mlp_0.apply(txt_modulated2.squeeze(0)), approximate="tanh")
-        txt_mlp_output = ffn_phase.txt_mlp_2.apply(txt_mlp_output)
-        encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
+        x_txt = txt_modulated2.squeeze(0)
+
+        if self.ffn_outlier_refiner is not None:
+            x_txt = self.ffn_outlier_refiner.apply_with_refinement(
+                x_txt, ffn_phase.txt_mlp_0,
+                f"transformer_blocks.{block_idx}.txt_mlp.net.0.proj.weight",
+                timestep=ts, actual_timestep=None, cond=cond,
+            )
+        else:
+            x_txt = ffn_phase.txt_mlp_0.apply(x_txt)
+        x_txt = F.gelu(x_txt, approximate="tanh")
+
+        if self.ffn_outlier_refiner is not None:
+            x_txt = self.ffn_outlier_refiner.apply_with_refinement(
+                x_txt, ffn_phase.txt_mlp_2,
+                f"transformer_blocks.{block_idx}.txt_mlp.net.2.weight",
+                timestep=ts, actual_timestep=None, cond=cond,
+            )
+        else:
+            x_txt = ffn_phase.txt_mlp_2.apply(x_txt)
+        encoder_hidden_states = encoder_hidden_states + txt_gate2 * x_txt
 
         # Clip to prevent overflow for fp16
         if encoder_hidden_states.dtype == torch.float16:
@@ -288,6 +387,14 @@ class QwenImageTransformerInfer(BaseTransformerInfer):
         image_rotary_emb,
         modulate_index=None,
     ):
+        # NOTE: do NOT set self.block_idx here.
+        # - Non-offload path: infer_calculating sets self.block_idx = idx before
+        #   each infer_block call (see below).
+        # - Offload paths: the loop in QwenImageOffloadTransformerInfer already
+        #   sets self.block_idx = block_idx before calling infer_block.
+        # Setting it here from block.compute_phases[3].block_index would be wrong
+        # for the offload path because cuda_buffers[0] is a reused buffer whose
+        # block_index attribute is NOT updated each iteration.
         img_query, img_key, img_value, img_gate1, img_mod2 = self.infer_img_qkv(
             img_attn_phase=block.compute_phases[0],
             hidden_states=hidden_states,
@@ -329,6 +436,51 @@ class QwenImageTransformerInfer(BaseTransformerInfer):
 
         return encoder_hidden_states, hidden_states
 
+    @torch.no_grad()
+    def preload_ffn_bf16_weights(self, transformer_weights=None):
+        """Eagerly load all MLP BF16 correction weights into the GPU cache.
+
+        Called once before step 0 (from QwenImageTransformerModel._infer).
+        Idempotent — subsequent calls are no-ops.
+
+        Qwen Image has 4 MLP layers per block (img/txt × mlp_0/mlp_2).
+        Layer-name convention mirrors the safetensors checkpoint keys so
+        FFNOutlierRefiner._load_bf16_weight can locate them in the sharded
+        BF16 checkpoint directory without any extra mapping.
+        """
+        if self.ffn_outlier_refiner is None:
+            return
+        layer_names = []
+        for i in range(self.blocks_num):
+            layer_names.append(f"transformer_blocks.{i}.img_mlp.net.0.proj.weight")
+            layer_names.append(f"transformer_blocks.{i}.img_mlp.net.2.weight")
+            layer_names.append(f"transformer_blocks.{i}.txt_mlp.net.0.proj.weight")
+            layer_names.append(f"transformer_blocks.{i}.txt_mlp.net.2.weight")
+        self.ffn_outlier_refiner.preload_bf16_weights(layer_names)
+
+        if getattr(self.ffn_outlier_refiner, "hotcol_enabled", False):
+            # Build the {layer_name: nvfp4_MMWeight} map for kernel-oracle Q recovery.
+            nvfp4_layers = None
+            if transformer_weights is not None:
+                nvfp4_layers = {}
+                try:
+                    for i in range(self.blocks_num):
+                        ffn = transformer_weights.blocks[i].compute_phases[3]
+                        for attr, name in (
+                            ("img_mlp_0", f"transformer_blocks.{i}.img_mlp.net.0.proj.weight"),
+                            ("img_mlp_2", f"transformer_blocks.{i}.img_mlp.net.2.weight"),
+                            ("txt_mlp_0", f"transformer_blocks.{i}.txt_mlp.net.0.proj.weight"),
+                            ("txt_mlp_2", f"transformer_blocks.{i}.txt_mlp.net.2.weight"),
+                        ):
+                            layer = getattr(ffn, attr, None)
+                            if layer is not None:
+                                nvfp4_layers[name] = layer
+                except Exception as e:
+                    logger.warning(f"[Hotcol-Qwen] could not build nvfp4 layer map ({e}); using ||W|| fallback")
+                    nvfp4_layers = None
+            self.ffn_outlier_refiner.prepare_hotcol_rotation(layer_names, nvfp4_layers=nvfp4_layers)
+            logger.info("[Hotcol-Qwen] hotcol pool prepared for all 4×blocks_num MLP layers")
+
     def infer_calculating(
         self,
         blocks,
@@ -340,6 +492,11 @@ class QwenImageTransformerInfer(BaseTransformerInfer):
         modulate_index,
     ):
         for idx in range(len(blocks)):
+            # Set block_idx BEFORE infer_block so infer_ffn reads the correct
+            # value via getattr(self, 'block_idx', 0).  blocks[idx] is the real
+            # weight object here (not a reused cuda_buffer), so its block_index
+            # is trustworthy — but we use the loop counter directly to be safe.
+            self.block_idx = idx
             encoder_hidden_states, hidden_states = self.infer_block(
                 block=blocks[idx],
                 hidden_states=hidden_states,
