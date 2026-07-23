@@ -561,6 +561,13 @@ class FFNOutlierRefiner:
         self.hotcol_dynamic = bool(hcd.get("enable", False))
         self.hotcol_pool_ratio = float(hcd.get("pool_ratio", 0.50))
         self.hotcol_use_dw = bool(hcd.get("use_dw_weight", True))
+        # Activation score base for dynamic column selection.
+        # "L1" (default): Σ_b |x_{b,k}|  — threshold-free, cheapest
+        # "L2": Σ_b x_{b,k}²             — energy-based, slightly stronger
+        # Both are multiplied by dw_pool² when use_dw_weight=True.
+        self.hotcol_score_base = hcd.get("score_base", "L1").upper()
+        assert self.hotcol_score_base in ("L1", "L2"), \
+            f"score_base must be 'L1' or 'L2', got '{self.hotcol_score_base}'"
         self.hotcol_prefetch = bool(hcd.get("prefetch", False))
         # Re-select the hot column set only every N steps (amortized dynamic).
         # 40-step real-trajectory data (column-set-drift memory): consecutive-step
@@ -1220,6 +1227,8 @@ class FFNOutlierRefiner:
                 "hot_idx": hot_idx,
                 "hot_block": hot_info,
                 "cold_blocks": cold_blocks,
+                "K": K,          # needed by lazy hot_mask build in _apply_hotcol_rotation
+                "hot_mask": None, # built on first call, then cached (hot set is frozen)
             }
             built += 1
 
@@ -1329,7 +1338,7 @@ class FFNOutlierRefiner:
             f"hot_ratio={self.hotcol_hot_ratio} pool_ratio={pool_ratio} | "
             f"dw_weight={'||B-Q|| on ' + str(dw_ok) + ' layers' if self.hotcol_use_dw else 'off (||W||)'} | "
             f"reselect_interval={self.hotcol_reselect_interval} | "
-            f"prefetch={self.hotcol_prefetch} | semantics=replacement (interval-reselect, L1 score)"
+            f"prefetch={self.hotcol_prefetch} | score_base={self.hotcol_score_base} | semantics=replacement (interval-reselect)"
         )
 
     def _apply_hotcol_dynamic(self, x, nvfp4_layer, layer_name, info, timestep, cond):
@@ -1465,17 +1474,21 @@ class FFNOutlierRefiner:
                 ev = torch.cuda.current_stream().record_event()
                 with torch.cuda.stream(score_stream):
                     score_stream.wait_event(ev)
-                    # Threshold-free activation score over full-K, coalesced.
-                    # w_norm=None -> the kernel ignores w_power and computes the
-                    # UNMASKED per-column mass Σ_b |x[b,k]| (tau=-1 masks nothing).
-                    # bench_actscore_variants.py: this Σ|x| == L2 (Σx²) == L1_tau
-                    # for column ranking (all within 0.1% true-NVFP4 error), so we
-                    # use the cheapest form and skip the per-call quantile entirely.
-                    sq_all = channel_score_fused(x, -1.0, None, 0.0)     # [K] Σ|x|
+                    # Activation score over full-K (threshold-free).
+                    # score_base="L1": Σ_b|x[b,k]|  (default, cheapest)
+                    # score_base="L2": Σ_b x[b,k]²  (energy, stronger ranking)
+                    # Both are multiplied by dw_pool² when use_dw_weight=True.
+                    if self.hotcol_score_base == "L2":
+                        sq_all = (x.float() ** 2).sum(0)           # [K] Σx²
+                    else:
+                        sq_all = channel_score_fused(x, -1.0, None, 0.0)  # [K] Σ|x|
                     pool_sq = sq_all.index_select(0, pool_cols)          # [P]
                     # Patch hot positions from intact snapshot (main stream may
                     # have zeroed them by now).
-                    hot_sq = channel_score_fused(x_hot_f32, -1.0, None, 0.0)  # [H]
+                    if self.hotcol_score_base == "L2":
+                        hot_sq = (x_hot_f32.float() ** 2).sum(0)    # [H] Σx²
+                    else:
+                        hot_sq = channel_score_fused(x_hot_f32, -1.0, None, 0.0)  # [H]
                     S_local = self._hotset_local_slots(info, key, hot_cols)
                     if S_local is not None:
                         pool_sq[S_local] = hot_sq
@@ -1484,7 +1497,10 @@ class FFNOutlierRefiner:
             except Exception as e:
                 logger.warning(f"[Hotcol-dyn] side-stream score failed for {layer_name} ({e}); sync fallback")
                 try:
-                    sq_all = channel_score_fused(x, -1.0, None, 0.0)
+                    if self.hotcol_score_base == "L2":
+                        sq_all = (x.float() ** 2).sum(0)
+                    else:
+                        sq_all = channel_score_fused(x, -1.0, None, 0.0)
                     pool_sq = sq_all.index_select(0, pool_cols)
                     self._hotcol_prev_score[key] = pool_sq * dw_pool_sq
                     self._hotcol_score_events.pop(key, None)
@@ -1623,14 +1639,26 @@ class FFNOutlierRefiner:
             x_cold_gathered.append(x.index_select(1, b["idx"]).to(torch.bfloat16))
 
         # ---- In-place zero active columns in x --------------------------------
-        # Collect all active column indices for this step (hot + selected cold).
-        active_indices = [info["hot_idx"]] if has_hot else []
-        for g in cold_sel:
-            active_indices.append(cold[g]["idx"])
+        # HOT columns: coalesced full-row mask-multiply, identical to the dynamic
+        # path. The hot set is frozen for the entire run, so we build the [K]
+        # keep-mask once (first call) and cache it alongside hot_idx.
+        # hot × 0 = 0 (exact), non-hot × 1 = self → bit-identical to index_fill_.
+        # Measured ~2–3× faster than strided index_fill_ on RTX 5090 (6.5 ms →
+        # 3.0 ms on ffn.2, B=75348): index_fill_ writes only B·H cells but each
+        # column is a separate strided store that crawls at ~6% HBM peak; mul_
+        # streams the whole [B, K] tensor once, fully coalesced.
+        if has_hot:
+            hot_mask = info.get("hot_mask")
+            if hot_mask is None:
+                hot_mask = self._build_hot_mask(info["hot_idx"], info["K"], x)
+                info["hot_mask"] = hot_mask
+            x.mul_(hot_mask.unsqueeze(0))
 
-        if active_indices:
-            all_active = torch.cat(active_indices)  # [total_active_cols]
-            x.index_fill_(1, all_active, 0)
+        # COLD columns (G blocks, small fraction of K): index_fill_ per block.
+        # Each cold block is a small slice (K·(1-hot_ratio)/R columns), so the
+        # strided write is short and its cost is negligible vs the BF16 GEMM.
+        for g in cold_sel:
+            x.index_fill_(1, cold[g]["idx"], 0)
 
         # ---- Main NVFP4 path (with outlier columns removed) -------------------
         y = nvfp4_layer.apply(x)
@@ -1954,6 +1982,48 @@ class FFNOutlierRefiner:
                 f"{freed} covered layers (~{freed_bytes / 1e9:.2f} GB reclaimed); "
                 f"{len(self.bf16_weight_cache)} dense weights still cached"
             )
+
+    def free_hotcol_gpu_cache(self) -> None:
+        """Free hotcol GPU-resident caches (for Wan2.2 MoE model switching).
+
+        When switching from high_noise to low_noise (or vice versa), the old model's
+        hotcol pool (~7.4GB on Wan2.2) stays resident on GPU. The new model then
+        preloads its own pool → OOM on 32GB cards. This method releases:
+          - hotcol_cache[*]["pool_Wt"]: the [P, N] resident pool (dynamic path)
+          - hotcol_cache[*]["hot_block"]["W_t"]: frozen hot weight (static path)
+          - _hotcol_hotset, _hotcol_prev_score: per-(layer,cond) runtime state
+
+        Called from WanModel.to_cpu() when offloading the inactive expert.
+        """
+        if not self.hotcol_enabled:
+            return
+        freed_mb = 0
+        # Dynamic path: drop pool_Wt [P, N] bf16 tensors (the big memory hog).
+        for layer_name, info in self.hotcol_cache.items():
+            pool_Wt = info.get("pool_Wt", None)
+            if pool_Wt is not None and pool_Wt.is_cuda:
+                freed_mb += pool_Wt.numel() * pool_Wt.element_size() / (1024**2)
+                info["pool_Wt"] = pool_Wt.cpu()  # move to CPU instead of del
+            # Static path: hot_block / cold_blocks hold correction weights.
+            hb = info.get("hot_block", None)
+            if hb and isinstance(hb, dict):
+                W_t = hb.get("W_t", None)
+                if W_t is not None and W_t.is_cuda:
+                    freed_mb += W_t.numel() * W_t.element_size() / (1024**2)
+                    hb["W_t"] = W_t.cpu()
+            for cb in info.get("cold_blocks", []):
+                if isinstance(cb, dict) and "block" in cb:
+                    blk = cb["block"]
+                    if isinstance(blk, dict) and "W_t" in blk:
+                        W_t = blk["W_t"]
+                        if W_t is not None and W_t.is_cuda:
+                            freed_mb += W_t.numel() * W_t.element_size() / (1024**2)
+                            blk["W_t"] = W_t.cpu()
+        # Per-(layer,cond) runtime state: drop GPU tensors (hot_Wt, scores).
+        self._hotcol_hotset.clear()
+        self._hotcol_prev_score.clear()
+        if freed_mb > 0:
+            logger.info(f"[Hotcol-MoE] Freed {freed_mb:.1f} MB GPU cache for model switch")
 
     # ------------------------------------------------------------------
     # Per-layer + per-step token ratio schedule (Rounds 2 & 3).
