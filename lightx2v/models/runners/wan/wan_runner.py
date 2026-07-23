@@ -26,6 +26,7 @@ from lightx2v.models.video_encoders.hf.wan.vae_2_2 import Wan2_2_VAE
 from lightx2v.models.video_encoders.hf.wan.vae_tiny import Wan2_2_VAE_tiny, WanVAE_tiny
 from lightx2v.server.metrics import monitor_cli
 from lightx2v.utils.envs import *
+from lightx2v.utils.global_paras import CURRENT_CALIB_EXPERT
 from lightx2v.utils.profiler import *
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
 from lightx2v.utils.utils import *
@@ -507,8 +508,55 @@ class MultiModelStruct:
             if model is not None:
                 model.set_scheduler(shared_scheduler)
 
+    def _free_inactive_expert_hotcol(self) -> None:
+        """Release the inactive expert's hotcol GPU tensors before the active one preloads.
+
+        For phase/block offload modes the NVFP4 weights are streamed layer-by-layer,
+        but the hotcol pool_Wt ([P, N] bf16, ~7.4 GB on Wan2.2) sits permanently on
+        GPU for each expert. When switching experts both pools would overlap → OOM.
+        This method moves the inactive expert's pool to CPU (and resets _ffn_preloaded
+        so it reloads to GPU next time that expert is activated).
+        """
+        inactive_idx = 1 - self.cur_model_index
+        inactive_model = self.model[inactive_idx] if inactive_idx < len(self.model) else None
+        if inactive_model is None:
+            return
+        infer_obj = getattr(inactive_model, "transformer_infer", None)
+        if infer_obj is None:
+            return
+        refiner = getattr(infer_obj, "ffn_outlier_refiner", None)
+        if refiner is not None and getattr(refiner, "hotcol_enabled", False):
+            refiner.free_hotcol_gpu_cache()
+            infer_obj._ffn_preloaded = False
+            import torch
+            torch.cuda.empty_cache()
+
+    def free_all_hotcol(self) -> None:
+        """Release hotcol GPU caches from ALL experts (for pre-VAE cleanup).
+
+        Called by the runner before VAE decode to reclaim the ~7-15 GB GPU memory
+        that hotcol pools occupy. Unlike _free_inactive_expert_hotcol (which only
+        cleans the inactive expert during model switching), this frees BOTH experts.
+        """
+        import torch
+        for idx, model in enumerate(self.model):
+            if model is None:
+                continue
+            infer_obj = getattr(model, "transformer_infer", None)
+            if infer_obj is None:
+                continue
+            refiner = getattr(infer_obj, "ffn_outlier_refiner", None)
+            if refiner is not None and getattr(refiner, "hotcol_enabled", False):
+                refiner.free_hotcol_gpu_cache()
+                infer_obj._ffn_preloaded = False
+        torch.cuda.empty_cache()
+
     def infer(self, inputs):
         self.get_current_model_index()
+        # For phase/block offload: NVFP4 weights are streamed but hotcol pool tensors
+        # are GPU-resident. Free the inactive expert's pool before the active one runs
+        # (which may trigger a first-time preload). This is a no-op when hotcol is off.
+        self._free_inactive_expert_hotcol()
         if not self.config.get("lazy_load", False) and not self.config.get("unload_modules", False):
             self.model[self.cur_model_index].infer(inputs)
         else:
@@ -560,6 +608,8 @@ class MultiModelStruct:
                     self.offload_cpu(model_index=1)
                     self.to_cuda(model_index=0)
             self.cur_model_index = 0
+            if self.config.get("do_mm_calib", False):
+                CURRENT_CALIB_EXPERT["name"] = "high_noise"
         else:
             logger.info(f"using - LOW - noise model at step_index {self.scheduler.step_index + 1}")
             self.scheduler.sample_guide_scale = self.config["sample_guide_scale"][1]
@@ -570,6 +620,8 @@ class MultiModelStruct:
                     self.offload_cpu(model_index=0)
                     self.to_cuda(model_index=1)
             self.cur_model_index = 1
+            if self.config.get("do_mm_calib", False):
+                CURRENT_CALIB_EXPERT["name"] = "low_noise"
 
     def offload_cpu(self, model_index):
         self.model[model_index].to_cpu()

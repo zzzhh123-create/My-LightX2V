@@ -52,6 +52,11 @@ class WanModel(BaseTransformerModel):
         self._init_infer_class()
         self._init_weights()
         self._init_infer()
+        # Wan2.2 MoE: two WanModel instances share the same config dict, but each
+        # expert's BF16 checkpoint lives under its own sub-directory. Patch the
+        # refiner's bf16_weight_path directly (per-instance, not in-place config
+        # mutation) so both high/low-noise experts load the right BF16 weights.
+        self._patch_moe_bf16_weight_path(model_type)
 
     def _init_infer_class(self):
         self.pre_infer_class = WanPreInfer
@@ -84,6 +89,55 @@ class WanModel(BaseTransformerModel):
         self.transformer_infer = self.transformer_infer_class(self.config)
         if hasattr(self.transformer_infer, "offload_manager"):
             self._init_offload_manager()
+
+    def _patch_moe_bf16_weight_path(self, model_type):
+        """Wan2.2 MoE: patch the per-expert BF16 weight path on the FFNOutlierRefiner.
+
+        Both high_noise and low_noise WanModel instances are created from the same
+        shared config dict, which can only hold one bf16_weight_path. But each expert
+        lives in its own sub-directory. We patch the refiner directly (per-instance,
+        no config mutation) so each model loads the right BF16 weights.
+
+        Config convention (both keys are optional; fallback is the shared path):
+          "high_noise_bf16_weight_path": "/path/to/Wan2.2/high_noise_model"
+          "low_noise_bf16_weight_path":  "/path/to/Wan2.2/low_noise_model"
+        """
+        refiner = getattr(self.transformer_infer, "ffn_outlier_refiner", None)
+        if refiner is None:
+            return
+        import os
+        if model_type == "wan2.2_moe_high_noise":
+            path = self.config.get("high_noise_bf16_weight_path", None)
+            if path is None:
+                # auto-derive from the quantized checkpoint path or model_path
+                base = self.config.get("high_noise_quantized_ckpt") or self.config.get("high_noise_original_ckpt")
+                if base is None:
+                    base = os.path.join(self.config.get("model_path", ""), "high_noise_model")
+                # BF16 dir lives next to the quantized dir: strip _nvfp4 / _fp8 suffix
+                bf16_base = base.rstrip("/")
+                for suffix in ("_nvfp4", "_fp8", "_int8"):
+                    if bf16_base.endswith(suffix):
+                        bf16_base = bf16_base[: -len(suffix)]
+                        break
+                path = bf16_base
+            if path and os.path.isdir(path):
+                refiner.bf16_weight_path = path
+                logger.info(f"[Hotcol-MoE] high_noise BF16 path → {path}")
+        elif model_type == "wan2.2_moe_low_noise":
+            path = self.config.get("low_noise_bf16_weight_path", None)
+            if path is None:
+                base = self.config.get("low_noise_quantized_ckpt") or self.config.get("low_noise_original_ckpt")
+                if base is None:
+                    base = os.path.join(self.config.get("model_path", ""), "low_noise_model")
+                bf16_base = base.rstrip("/")
+                for suffix in ("_nvfp4", "_fp8", "_int8"):
+                    if bf16_base.endswith(suffix):
+                        bf16_base = bf16_base[: -len(suffix)]
+                        break
+                path = bf16_base
+            if path and os.path.isdir(path):
+                refiner.bf16_weight_path = path
+                logger.info(f"[Hotcol-MoE] low_noise BF16 path → {path}")
 
     def _should_init_empty_model(self):
         if self.config.get("lora_configs") and self.config["lora_configs"] and not self.config.get("lora_dynamic_apply", False):
@@ -156,6 +210,20 @@ class WanModel(BaseTransformerModel):
         combined_output = torch.cat(gathered_x, dim=0)
         return combined_output
 
+    def to_cpu(self):
+        """Move all weights to CPU, releasing hotcol GPU caches for MoE model switching.
+
+        For Wan2.2 MoE: when the inactive expert is offloaded, its hotcol pool_Wt
+        (~7.4 GB on Wan2.2) must be moved off GPU so the other expert can preload
+        its own pool without OOM. Resets _ffn_preloaded so the next activation
+        re-uploads the pool back to GPU.
+        """
+        refiner = getattr(getattr(self, "transformer_infer", None), "ffn_outlier_refiner", None)
+        if refiner is not None:
+            refiner.free_hotcol_gpu_cache()
+            self.transformer_infer._ffn_preloaded = False
+        super().to_cpu()
+
     @torch.no_grad()
     def infer(self, inputs):
         # Update timestep for profiling
@@ -168,10 +236,12 @@ class WanModel(BaseTransformerModel):
             except Exception:
                 self.transformer_infer.current_actual_timestep = None
 
-        # Preload all BF16 FFN correction weights before the first step so the
-        # outlier/channel BF16 path is resident up front (like the NVFP4 weights),
+        # Preload all BF16 FFN correction weights on FIRST CALL to this model instance
+        # (not necessarily step_index==0, because Wan2.2 MoE's low_noise model is first
+        # invoked around step ~35). Check a per-transformer flag instead of step_index.
+        # The outlier/channel BF16 path is resident up front (like the NVFP4 weights),
         # instead of paying lazy-load stalls on the first FFN call. Idempotent.
-        if self.scheduler.step_index == 0 and hasattr(self.transformer_infer, "preload_ffn_bf16_weights"):
+        if hasattr(self.transformer_infer, "preload_ffn_bf16_weights") and not getattr(self.transformer_infer, "_ffn_preloaded", False):
             # PBS v2.0: expose the normalized noise schedule (sigma) to the
             # refiner so the analytic step-0 schedule build can use the single
             # sigma scalar lam = 1 - mean(sigma_norm). Signal set stays
@@ -218,6 +288,7 @@ class WanModel(BaseTransformerModel):
                 except Exception as _e:
                     logger.warning(f"[DUMP] clip_fea dump failed: {_e}")
             self.transformer_infer.preload_ffn_bf16_weights(self.transformer_weights)
+            self.transformer_infer._ffn_preloaded = True
 
         if self.cpu_offload:
             if self.offload_granularity == "model" and self.scheduler.step_index == 0 and "wan2.2_moe" not in self.config["model_cls"]:

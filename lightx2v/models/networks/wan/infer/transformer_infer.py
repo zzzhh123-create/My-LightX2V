@@ -106,6 +106,10 @@ class WanTransformerInfer(BaseTransformerInfer):
         self.current_timestep = 0
         # Actual scheduler timestep value (e.g. ~1000..0) for channel profiling.
         self.current_actual_timestep = None
+        # Track whether FFN BF16 weights have been preloaded (for Wan2.2 MoE dual-model).
+        # The low_noise model is first invoked at step ~35 (not step 0), so we need a
+        # per-transformer flag instead of relying on scheduler.step_index==0.
+        self._ffn_preloaded = False
 
         # ---- Cross-attention K/V cache (math-preserving, opt-in) -------------
         # The cross-attn key/value projections consume ONLY `context` (text emb)
@@ -544,6 +548,32 @@ class WanTransformerInfer(BaseTransformerInfer):
         if self.sensitive_layer_dtype != self.infer_dtype:
             norm2_out = norm2_out.to(self.infer_dtype)
 
+        # ---- Multi-layer granularity dump (research, env-gated) -------------
+        # Dumps the ffn.0 INPUT (norm2_out) for a SET of target blocks across
+        # every step, with a fixed row subsample. Used to replicate the M1
+        # granularity study (element/column/row error efficiency) on layers
+        # OTHER than block20 ffn.2 — specifically ffn.0 (LayerNorm-space input),
+        # which has a different activation distribution than the post-GELU
+        # ffn.2 input. Zero effect when LIGHTX2V_MLDUMP is unset.
+        import os as _os
+        if _os.getenv("LIGHTX2V_MLDUMP", "0") == "1":
+            _blks = [int(b) for b in _os.getenv("LIGHTX2V_MLDUMP_BLOCKS", "0,20,39").split(",")]
+            if self.block_idx in _blks and self.scheduler.infer_condition:
+                _dir = _os.getenv("LIGHTX2V_MLDUMP_DIR", "/root/autodl-tmp/LightX2V/mldump")
+                _os.makedirs(_dir, exist_ok=True)
+                _si = self.scheduler.step_index
+                _smax = int(_os.getenv("LIGHTX2V_MLDUMP_MAXSTEP", "40"))
+                if _si < _smax:
+                    _nrow = int(_os.getenv("LIGHTX2V_MLDUMP_ROWS", "512"))
+                    _B0 = norm2_out.shape[0]
+                    _g = torch.Generator(device="cpu").manual_seed(1234)
+                    _ridx = torch.randperm(_B0, generator=_g)[:_nrow]
+                    torch.save(
+                        {"x": norm2_out.detach()[_ridx.to(norm2_out.device)].float().cpu(),
+                         "rows": _ridx, "step": _si, "layer": f"blocks.{self.block_idx}.ffn.0"},
+                        _os.path.join(_dir, f"ml_b{self.block_idx}_ffn0_s{_si:03d}.pt"),
+                    )
+
         # FFN layer 0 with optional outlier refinement
         if self.ffn_outlier_refiner is not None:
             ffn_0_layer_name = f"blocks.{self.block_idx}.ffn.0.weight"
@@ -560,6 +590,30 @@ class WanTransformerInfer(BaseTransformerInfer):
         y = torch.nn.functional.gelu(y, approximate="tanh")
         if self.clean_cuda_cache:
             torch.cuda.empty_cache()
+
+        # ---- Multi-layer granularity dump: ffn.2 INPUT (post-GELU y) --------
+        # Companion to the ffn.0 dump above. Same target-block set / row
+        # subsample, so offline we get element/column/row error curves for
+        # ffn.2 at multiple depths (block0 shallow, block20 mid, block39 deep)
+        # — testing whether the M1 granularity ordering generalizes across
+        # depth. Zero effect when LIGHTX2V_MLDUMP is unset.
+        if _os.getenv("LIGHTX2V_MLDUMP", "0") == "1":
+            _blks2 = [int(b) for b in _os.getenv("LIGHTX2V_MLDUMP_BLOCKS", "0,20,39").split(",")]
+            if self.block_idx in _blks2 and self.scheduler.infer_condition:
+                _dir = _os.getenv("LIGHTX2V_MLDUMP_DIR", "/root/autodl-tmp/LightX2V/mldump")
+                _os.makedirs(_dir, exist_ok=True)
+                _si = self.scheduler.step_index
+                _smax = int(_os.getenv("LIGHTX2V_MLDUMP_MAXSTEP", "40"))
+                if _si < _smax:
+                    _nrow = int(_os.getenv("LIGHTX2V_MLDUMP_ROWS", "512"))
+                    _B2 = y.shape[0]
+                    _g = torch.Generator(device="cpu").manual_seed(1234)
+                    _ridx = torch.randperm(_B2, generator=_g)[:_nrow]
+                    torch.save(
+                        {"x": y.detach()[_ridx.to(y.device)].float().cpu(),
+                         "rows": _ridx, "step": _si, "layer": f"blocks.{self.block_idx}.ffn.2"},
+                        _os.path.join(_dir, f"ml_b{self.block_idx}_ffn2_s{_si:03d}.pt"),
+                    )
 
         # ---- Cross-step error-coherence capture (research, env-gated) -------
         # Dumps the post-GELU ffn.2 INPUT x_t for ONE target block across every
