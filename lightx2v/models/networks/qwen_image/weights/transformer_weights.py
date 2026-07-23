@@ -16,6 +16,9 @@ class QwenImageTransformerWeights(WeightModule):
         self.mm_type = config.get("dit_quant_scheme", "Default")
         if self.mm_type != "Default":
             assert config.get("dit_quantized") is True
+        if config.get("do_mm_calib", False):
+            self.mm_type = "Calib"
+            assert not config["cpu_offload"]
         self.lazy_load = self.config.get("lazy_load", False)
         blocks = WeightModuleList(
             QwenImageTransformerAttentionBlock(

@@ -11,6 +11,10 @@ class ZImagePostWeights(WeightModule):
         self.task = config["task"]
         self.config = config
         self.mm_type = config.get("dit_quant_scheme", "Default")
+        if self.mm_type != "Default":
+            assert config.get("dit_quantized") is True
+        if config.get("do_mm_calib", False):
+            self.mm_type = "Calib"
         self.add_module(
             "norm_out_linear",
             MM_WEIGHT_REGISTER[self.mm_type](
